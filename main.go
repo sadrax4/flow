@@ -439,14 +439,15 @@ func applyFont(size int32) {
 	lineH = tm[0]
 	// The bar hugs one line of text so it sits flush under the top edge of the screen.
 	r := windowRect()
-	call(pSetWindowPos, hMain, 0, 0, 0, uintptr(r.Right-r.Left), uintptr(lineH+2*textMargin()), swpNoMove|swpNoZOrder|swpNoActivate)
+	call(pSetWindowPos, hMain, 0, 0, 0, uintptr(r.Right-r.Left), uintptr(lineH+bottomMargin()), swpNoMove|swpNoZOrder|swpNoActivate)
 	ensureBuffer()
 	buildChunks()
 	pos = clampPos(keep * total)
 	target = pos
 }
 
-func textMargin() int32 { return px(3) }
+// Text sits at the very top of the bar; the font's own internal leading keeps a small gap above the glyphs.
+func bottomMargin() int32 { return px(2) }
 
 func makeFade(opaqueLeft bool) uintptr {
 	bi := bitmapInfo{biSize: 40, biWidth: fadeW, biHeight: 1, biPlanes: 1, biBitCount: 32}
@@ -496,7 +497,7 @@ func draw() {
 			dtCenter|dtVCenter|dtSingleLine|dtNoPrefix)
 		call(pSetTextColor, memDC, 0xFFFFFF)
 	}
-	y := textMargin()
+	y := int32(0)
 	for i := range chunks {
 		c := &chunks[i]
 		x := chunkX(c)
