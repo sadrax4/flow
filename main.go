@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -17,72 +18,24 @@ func init() { runtime.LockOSThread() }
 
 const (
 	wsPopup     = 0x80000000
-	wsVisible   = 0x10000000
-	wsChild     = 0x40000000
 	wsExLayered = 0x00080000
 	wsExTopmost = 0x00000008
 
-	esMultiline   = 0x0004
-	esAutoVScroll = 0x0040
-
 	wmDestroy        = 0x0002
-	wmSetFocus       = 0x0007
 	wmKillFocus      = 0x0008
+	wmPaint          = 0x000F
 	wmClose          = 0x0010
-	wmContextMenu    = 0x007B
+	wmEraseBkgnd     = 0x0014
 	wmKeyDown        = 0x0100
 	wmKeyUp          = 0x0101
-	wmChar           = 0x0102
-	wmCommand        = 0x0111
 	wmTimer          = 0x0113
 	wmMouseMove      = 0x0200
 	wmLButtonDown    = 0x0201
+	wmLButtonUp      = 0x0202
 	wmRButtonDown    = 0x0204
 	wmRButtonUp      = 0x0205
 	wmMouseWheel     = 0x020A
 	wmCaptureChanged = 0x0215
-	wmCut            = 0x0300
-	wmCopy           = 0x0301
-	wmPaste          = 0x0302
-
-	emGetSel              = 0x00B0
-	emSetSel              = 0x00B1
-	emSetRect             = 0x00B3
-	emGetLineCount        = 0x00BA
-	emLineIndex           = 0x00BB
-	emUndo                = 0x00C7
-	emGetFirstVisibleLine = 0x00CE
-	emPosFromChar         = 0x00D6
-	emExLimitText         = 0x0435
-	emExLineFromChar      = 0x0436
-	emSetBkgndColor       = 0x0443
-	emSetCharFormat       = 0x0444
-	emSetEventMask        = 0x0445
-	emSetParaFormat       = 0x0447
-	emRedo                = 0x0454
-	emSetTextMode         = 0x0459
-	emGetScrollPos        = 0x04DD
-	emSetScrollPos        = 0x04DE
-
-	enChange  = 0x0300
-	enmChange = 0x00000001
-
-	tmPlainText      = 1
-	tmMultiLevelUndo = 8
-	tmMultiCodePage  = 32
-
-	scfDefault = 0
-	scfAll     = 4
-	cfeBold    = 0x00000001
-	cfmBold    = 0x00000001
-	cfmFace    = 0x20000000
-	cfmColor   = 0x40000000
-	cfmSize    = 0x80000000
-
-	pfmAlignment = 0x00000008
-	pfmRTLPara   = 0x00010000
-	pfeRTLPara   = 0x0001
-	pfaCenter    = 3
 
 	vkBack     = 0x08
 	vkShift    = 0x10
@@ -105,23 +58,42 @@ const (
 	vkOemMinus = 0xBD
 	mkControl  = 0x0008
 
+	ssaFallback = 0x0020
+	ssaGlyphs   = 0x0080
+	ssaRTL      = 0x0100
+	ssaLink     = 0x1000
+
+	cfUnicodeText = 13
+	gmemMoveable  = 0x0002
+	srcCopy       = 0x00CC0020
+	bkTransparent = 1
+	dtCenter      = 0x0001
+	dtVCenter     = 0x0004
+	dtSingleLine  = 0x0020
+	dtNoPrefix    = 0x0800
+
 	swpNoSize     = 0x0001
 	swpNoZOrder   = 0x0004
 	swpNoActivate = 0x0010
 
 	lwaAlpha              = 0x2
 	wdaExcludeFromCapture = 0x11
-	saveTimer             = 1
-	animTimer             = 2
+	animTimer             = 1
+	saveTimer             = 2
 	opacity               = 217
 
-	holdLinesPerSec = 2.5
-	easeSeconds     = 0.08
+	springOmega  = 14.0
+	holdSpeedEms = 8.0
+	separator    = "   •   "
+	hintText     = "Ctrl+V  =  paste your text"
 )
 
-const helpText = "Ctrl+V = paste your text      Arrows = smooth scroll (hold to glide)\r\n" +
-	"Ctrl + / Ctrl - / Ctrl+Wheel = text size\r\n" +
-	"Ctrl+Arrows = resize      Right-drag = move      Esc = close"
+const helpText = "Ctrl+V = paste your text\n" +
+	"Right / Left arrow = move the text (hold to glide)\n" +
+	"Ctrl + / Ctrl - = text size\n" +
+	"Ctrl + arrows = bar size\n" +
+	"Drag = move the bar\n" +
+	"Esc = close"
 
 type point struct{ X, Y int32 }
 type rect struct{ Left, Top, Right, Bottom int32 }
@@ -150,59 +122,51 @@ type msgT struct {
 	pt      point
 }
 
-// CHARFORMATW, 92 bytes.
-type charFormatW struct {
-	cbSize          uint32
-	dwMask          uint32
-	dwEffects       uint32
-	yHeight         int32
-	yOffset         int32
-	crTextColor     uint32
-	bCharSet        byte
-	bPitchAndFamily byte
-	szFaceName      [32]uint16
+type paintStruct struct {
+	hdc         uintptr
+	fErase      int32
+	rcPaint     rect
+	fRestore    int32
+	fIncUpdate  int32
+	rgbReserved [32]byte
 }
 
-// PARAFORMAT2, 188 bytes.
-type paraFormat2 struct {
-	cbSize           uint32
-	dwMask           uint32
-	wNumbering       uint16
-	wEffects         uint16
-	dxStartIndent    int32
-	dxRightIndent    int32
-	dxOffset         int32
-	wAlignment       uint16
-	cTabCount        int16
-	rgxTabs          [32]int32
-	dySpaceBefore    int32
-	dySpaceAfter     int32
-	dyLineSpacing    int32
-	sStyle           int16
-	bLineSpacingRule byte
-	bOutlineLevel    byte
-	wShadingWeight   uint16
-	wShadingStyle    uint16
-	wNumberingStart  uint16
-	wNumberingStyle  uint16
-	wNumberingTab    uint16
-	wBorderSpace     uint16
-	wBorderWidth     uint16
-	wBorders         uint16
+type bitmapInfo struct {
+	biSize          uint32
+	biWidth         int32
+	biHeight        int32
+	biPlanes        uint16
+	biBitCount      uint16
+	biCompression   uint32
+	biSizeImage     uint32
+	biXPelsPerMeter int32
+	biYPelsPerMeter int32
+	biClrUsed       uint32
+	biClrImportant  uint32
+	colors          [1]uint32
 }
 
-type config struct{ X, Y, W, H, Font int32 }
+// One shaped run of the script; the whole script is laid out as a single line of these.
+type chunk struct {
+	ssa          uintptr
+	buf          []uint16
+	start, width float64
+}
+
+type config struct {
+	X, Y, W, H, Font int32
+	Pos              float64
+}
 
 var (
 	user32   = syscall.NewLazyDLL("user32.dll")
 	gdi32    = syscall.NewLazyDLL("gdi32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	usp10    = syscall.NewLazyDLL("usp10.dll")
 
 	pRegisterClassExW           = user32.NewProc("RegisterClassExW")
 	pCreateWindowExW            = user32.NewProc("CreateWindowExW")
 	pDefWindowProcW             = user32.NewProc("DefWindowProcW")
-	pCallWindowProcW            = user32.NewProc("CallWindowProcW")
-	pSetWindowLongPtrW          = user32.NewProc("SetWindowLongPtrW")
 	pShowWindow                 = user32.NewProc("ShowWindow")
 	pSetForegroundWindow        = user32.NewProc("SetForegroundWindow")
 	pGetMessageW                = user32.NewProc("GetMessageW")
@@ -210,14 +174,12 @@ var (
 	pDispatchMessageW           = user32.NewProc("DispatchMessageW")
 	pPostQuitMessage            = user32.NewProc("PostQuitMessage")
 	pPostMessageW               = user32.NewProc("PostMessageW")
-	pSendMessageW               = user32.NewProc("SendMessageW")
 	pDestroyWindow              = user32.NewProc("DestroyWindow")
 	pSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
 	pSetWindowDisplayAffinity   = user32.NewProc("SetWindowDisplayAffinity")
 	pSetProcessDPIAware         = user32.NewProc("SetProcessDPIAware")
 	pGetSystemMetrics           = user32.NewProc("GetSystemMetrics")
 	pSetWindowPos               = user32.NewProc("SetWindowPos")
-	pMoveWindow                 = user32.NewProc("MoveWindow")
 	pGetWindowRect              = user32.NewProc("GetWindowRect")
 	pSetWindowRgn               = user32.NewProc("SetWindowRgn")
 	pSetCapture                 = user32.NewProc("SetCapture")
@@ -230,33 +192,69 @@ var (
 	pKillTimer                  = user32.NewProc("KillTimer")
 	pGetDC                      = user32.NewProc("GetDC")
 	pReleaseDC                  = user32.NewProc("ReleaseDC")
-	pGetWindowTextLengthW       = user32.NewProc("GetWindowTextLengthW")
-	pGetWindowTextW             = user32.NewProc("GetWindowTextW")
-	pSetWindowTextW             = user32.NewProc("SetWindowTextW")
+	pBeginPaint                 = user32.NewProc("BeginPaint")
+	pEndPaint                   = user32.NewProc("EndPaint")
+	pFillRect                   = user32.NewProc("FillRect")
+	pDrawTextW                  = user32.NewProc("DrawTextW")
+	pOpenClipboard              = user32.NewProc("OpenClipboard")
+	pCloseClipboard             = user32.NewProc("CloseClipboard")
+	pEmptyClipboard             = user32.NewProc("EmptyClipboard")
+	pGetClipboardData           = user32.NewProc("GetClipboardData")
+	pSetClipboardData           = user32.NewProc("SetClipboardData")
 
-	pCreateSolidBrush   = gdi32.NewProc("CreateSolidBrush")
-	pCreateRoundRectRgn = gdi32.NewProc("CreateRoundRectRgn")
-	pGetDeviceCaps      = gdi32.NewProc("GetDeviceCaps")
-	pGetModuleHandleW   = kernel32.NewProc("GetModuleHandleW")
+	pCreateSolidBrush       = gdi32.NewProc("CreateSolidBrush")
+	pCreateRoundRectRgn     = gdi32.NewProc("CreateRoundRectRgn")
+	pCreateFontW            = gdi32.NewProc("CreateFontW")
+	pCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
+	pCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
+	pCreateDIBSection       = gdi32.NewProc("CreateDIBSection")
+	pSelectObject           = gdi32.NewProc("SelectObject")
+	pDeleteObject           = gdi32.NewProc("DeleteObject")
+	pBitBlt                 = gdi32.NewProc("BitBlt")
+	pGdiAlphaBlend          = gdi32.NewProc("GdiAlphaBlend")
+	pSetTextColor           = gdi32.NewProc("SetTextColor")
+	pSetBkMode              = gdi32.NewProc("SetBkMode")
+	pGetTextMetricsW        = gdi32.NewProc("GetTextMetricsW")
+	pGetDeviceCaps          = gdi32.NewProc("GetDeviceCaps")
+
+	pGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
+	pGlobalAlloc      = kernel32.NewProc("GlobalAlloc")
+	pGlobalFree       = kernel32.NewProc("GlobalFree")
+	pGlobalLock       = kernel32.NewProc("GlobalLock")
+	pGlobalUnlock     = kernel32.NewProc("GlobalUnlock")
+	pLstrlenW         = kernel32.NewProc("lstrlenW")
+	pRtlMoveMemory    = kernel32.NewProc("RtlMoveMemory")
+
+	pScriptStringAnalyse = usp10.NewProc("ScriptStringAnalyse")
+	pScriptStringOut     = usp10.NewProc("ScriptStringOut")
+	pScriptStringFree    = usp10.NewProc("ScriptStringFree")
+	pScriptStringPSize   = usp10.NewProc("ScriptString_pSize")
 )
 
 var (
-	hMain, hEdit, origEditProc, bgBrush uintptr
-	scale                                     = 1.0
-	fontSize                            int32 = 28
-	rtl                                 bool
-	dragging                            bool
-	dragCursor, dragWin                 point
+	hMain, memDC, memBmp, curFont uintptr
+	bgBrush, selBrush             uintptr
+	fadeDC                        [2]uintptr
+	bufW, bufH, fadeW, lineH      int32
+	scale                               = 1.0
+	fontSize                      int32 = 36
 
-	animating     bool
-	curY, targetY float64
-	hold          int
-	snapAtEnd     bool
-	holdVK        uintptr
-	lastTick      time.Time
+	text        string
+	chunks      []chunk
+	total       float64
+	rtl         bool
+	allSelected bool
 
-	// Negative Win32 constants live in variables: converting a negative constant to uintptr is a compile error.
-	gwlpWndProc int32 = -4
+	animating        bool
+	pos, target, vel float64
+	hold             int
+	holdVK           uintptr
+	lastTick         time.Time
+
+	dragging            bool
+	dragCursor, dragWin point
+
+	rtlState uint16 = 1 // package-level so its address stays fixed while Uniscribe reads it
 )
 
 //go:uintptrescapes
@@ -264,9 +262,6 @@ func call(p *syscall.LazyProc, a ...uintptr) uintptr {
 	r, _, _ := p.Call(a...)
 	return r
 }
-
-//go:uintptrescapes
-func send(msg, wp, lp uintptr) uintptr { return call(pSendMessageW, hEdit, msg, wp, lp) }
 
 func str(s string) *uint16 {
 	p, _ := syscall.UTF16PtrFromString(strings.ReplaceAll(s, "\x00", ""))
@@ -287,16 +282,9 @@ func windowRect() rect {
 	return r
 }
 
-func crlf(s string) string {
-	s = strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
-	return strings.ReplaceAll(s, "\n", "\r\n")
-}
-
-func getText() string {
-	n := call(pGetWindowTextLengthW, hEdit)
-	buf := make([]uint16, n+1)
-	call(pGetWindowTextW, hEdit, uintptr(unsafe.Pointer(&buf[0])), n+1)
-	return syscall.UTF16ToString(buf)
+func normalize(s string) string {
+	s = strings.ReplaceAll(s, "\x00", "")
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
 }
 
 func isRTL(s string) bool {
@@ -315,144 +303,195 @@ func isRTL(s string) bool {
 	return rtlCount > ltrCount
 }
 
-func getScroll() int32 {
-	var p point
-	send(emGetScrollPos, 0, uintptr(unsafe.Pointer(&p)))
-	return p.Y
-}
-
-func setScroll(y int32) {
-	p := point{0, max(y, 0)}
-	send(emSetScrollPos, 0, uintptr(unsafe.Pointer(&p)))
-}
-
-func lineTop(line uintptr) int32 {
-	var p point
-	send(emPosFromChar, uintptr(unsafe.Pointer(&p)), send(emLineIndex, line, 0))
-	return p.Y
-}
-
-func lineCount() int { return int(send(emGetLineCount, 0, 0)) }
-
-// Scroll offset that puts line i at the top of the view.
-func boundary(i int, top0 int32) float64 { return float64(lineTop(uintptr(i)) - top0) }
-
-// Furthest scroll that still shows the last line at the top; the control may clamp earlier, which tick() detects.
-func maxScroll() float64 {
-	n := lineCount()
-	if n < 2 {
-		return 0
-	}
-	return boundary(n-1, lineTop(0))
-}
-
-func lineHeight() float64 {
-	if n := lineCount(); n >= 2 {
-		if m := maxScroll(); m > 0 {
-			return m / float64(n-1)
+// Paragraphs joined by a separator, cut at spaces into runs small enough to shape quickly.
+func pieces(s string) []string {
+	var paras, out []string
+	for _, p := range strings.Split(s, "\n") {
+		if p = strings.Join(strings.Fields(p), " "); p != "" {
+			paras = append(paras, p)
 		}
 	}
-	return float64(px(fontSize)) * 1.33
-}
-
-// First line boundary strictly past y in direction dir. Binary search over real line positions,
-// since font fallback for mixed scripts can give lines different heights.
-func nextBoundary(y float64, dir int) float64 {
-	n := lineCount()
-	if n < 2 {
-		return 0
-	}
-	top0 := lineTop(0)
-	lo, hi := 0, n-1
-	if dir > 0 {
-		if boundary(hi, top0) <= y+0.5 {
-			return boundary(hi, top0)
+	for i, p := range paras {
+		if i < len(paras)-1 {
+			p += separator
 		}
-		for lo < hi {
-			mid := (lo + hi) / 2
-			if boundary(mid, top0) > y+0.5 {
-				hi = mid
-			} else {
-				lo = mid + 1
+		for p != "" {
+			cut := len(p)
+			if cut > 600 {
+				cut = strings.LastIndex(p[:600], " ") + 1
+				if cut <= 0 {
+					cut = 600
+					for cut > 0 && !utf8.RuneStart(p[cut]) {
+						cut--
+					}
+				}
 			}
-		}
-		return boundary(lo, top0)
-	}
-	for lo < hi {
-		mid := (lo + hi + 1) / 2
-		if boundary(mid, top0) < y-0.5 {
-			lo = mid
-		} else {
-			hi = mid - 1
+			out = append(out, p[:cut])
+			p = p[cut:]
 		}
 	}
-	return boundary(lo, top0)
+	return out
 }
 
-func clampScroll(y float64) float64 { return math.Max(0, math.Min(y, maxScroll())) }
+func freeChunks() {
+	for i := range chunks {
+		call(pScriptStringFree, uintptr(unsafe.Pointer(&chunks[i].ssa)))
+	}
+	chunks, total = nil, 0
+}
 
-func layout() {
+func buildChunks() {
+	freeChunks()
+	rtl = isRTL(text)
+	flags := uintptr(ssaGlyphs | ssaFallback | ssaLink)
+	// SCRIPT_STATE with uBidiLevel=1 as well as SSA_RTL: some Uniscribe builds only honor one of them.
+	statePtr := uintptr(0)
+	if rtl {
+		flags |= ssaRTL
+		statePtr = uintptr(unsafe.Pointer(&rtlState))
+	}
+	for _, piece := range pieces(text) {
+		buf, err := syscall.UTF16FromString(piece)
+		n := len(buf) - 1
+		if err != nil || n <= 0 {
+			continue
+		}
+		var ssa uintptr
+		hr := call(pScriptStringAnalyse, memDC, uintptr(unsafe.Pointer(&buf[0])), uintptr(n), uintptr(n*3/2+16),
+			^uintptr(0), flags, 0, 0, statePtr, 0, 0, 0, uintptr(unsafe.Pointer(&ssa)))
+		if int32(hr) != 0 || ssa == 0 {
+			continue
+		}
+		var size point
+		call(pRtlMoveMemory, uintptr(unsafe.Pointer(&size)), call(pScriptStringPSize, ssa), 8)
+		chunks = append(chunks, chunk{ssa: ssa, buf: buf, start: total, width: float64(size.X)})
+		total += float64(size.X)
+	}
+}
+
+func inset() int32 { return fadeW + px(8) }
+
+func maxPos() float64 { return math.Max(0, total-float64(bufW-2*inset())) }
+
+func clampPos(p float64) float64 { return math.Max(0, math.Min(p, maxPos())) }
+
+func step() float64 { return float64(bufW-2*inset()) / 3 }
+
+// pos grows in reading order; RTL text starts at the right edge and advances by moving right.
+func chunkX(c *chunk) int32 {
+	if rtl {
+		return int32(math.Round(float64(bufW-inset()) + pos - c.start - c.width))
+	}
+	return int32(math.Round(float64(inset()) - pos + c.start))
+}
+
+func applyFont(size int32) {
+	keep := 0.0
+	if total > 0 {
+		keep = pos / total
+	}
+	freeChunks()
+	fontSize = clamp(size, 12, 200)
+	f := call(pCreateFontW, uintptr(-px(fontSize)), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(str("Segoe UI"))))
+	call(pSelectObject, memDC, f)
+	if curFont != 0 {
+		call(pDeleteObject, curFont)
+	}
+	curFont = f
+	var tm [16]int32
+	call(pGetTextMetricsW, memDC, uintptr(unsafe.Pointer(&tm[0])))
+	lineH = tm[0]
+	buildChunks()
+	pos = clampPos(keep * total)
+	target = pos
+}
+
+func makeFade(opaqueLeft bool) uintptr {
+	bi := bitmapInfo{biSize: 40, biWidth: fadeW, biHeight: 1, biPlanes: 1, biBitCount: 32}
+	var bits uintptr
+	dc := call(pCreateCompatibleDC, 0)
+	bmp := call(pCreateDIBSection, dc, uintptr(unsafe.Pointer(&bi)), 0, uintptr(unsafe.Pointer(&bits)), 0, 0)
+	pix := make([]byte, fadeW*4)
+	for i := range fadeW {
+		t := float64(i) / float64(fadeW-1)
+		if opaqueLeft {
+			t = 1 - t
+		}
+		pix[i*4+3] = byte(255 * t * t * (3 - 2*t))
+	}
+	if bits != 0 {
+		call(pRtlMoveMemory, bits, uintptr(unsafe.Pointer(&pix[0])), uintptr(len(pix)))
+	}
+	call(pSelectObject, dc, bmp)
+	return dc
+}
+
+func ensureBuffer() {
 	r := windowRect()
 	w, h := r.Right-r.Left, r.Bottom-r.Top
-	call(pMoveWindow, hEdit, 0, 0, uintptr(w), uintptr(h), 1)
-	pad := rect{px(16), px(6), w - px(16), h - px(4)}
-	send(emSetRect, 0, uintptr(unsafe.Pointer(&pad)))
+	if memBmp != 0 && w == bufW && h == bufH {
+		return
+	}
+	screen := call(pGetDC, 0)
+	bmp := call(pCreateCompatibleBitmap, screen, uintptr(w), uintptr(h))
+	call(pReleaseDC, 0, screen)
+	call(pSelectObject, memDC, bmp)
+	if memBmp != 0 {
+		call(pDeleteObject, memBmp)
+	}
+	memBmp, bufW, bufH = bmp, w, h
 	rad := uintptr(px(28))
 	call(pSetWindowRgn, hMain, call(pCreateRoundRectRgn, 0, 0, uintptr(w+1), uintptr(h+1), rad, rad), 1)
 }
 
-// Later size changes set only the size, so fonts the control picked for other scripts (e.g. Persian, emoji) survive.
-func applyFont(size int32, mask uint32) {
-	stopAnim()
-	fontSize = clamp(size, 10, 200)
-	cf := charFormatW{dwMask: mask, dwEffects: cfeBold, yHeight: fontSize * 15, crTextColor: 0xFFFFFF}
-	cf.cbSize = uint32(unsafe.Sizeof(cf))
-	face, _ := syscall.UTF16FromString("Segoe UI")
-	copy(cf.szFaceName[:31], face)
-	send(emSetCharFormat, scfAll, uintptr(unsafe.Pointer(&cf)))
-	send(emSetCharFormat, scfDefault, uintptr(unsafe.Pointer(&cf)))
-	layout()
-}
-
-func applyPara() {
-	pf := paraFormat2{dwMask: pfmAlignment | pfmRTLPara, wAlignment: pfaCenter}
-	pf.cbSize = uint32(unsafe.Sizeof(pf))
-	if rtl {
-		pf.wEffects = pfeRTLPara
+func draw() {
+	full := rect{0, 0, bufW, bufH}
+	call(pFillRect, memDC, uintptr(unsafe.Pointer(&full)), bgBrush)
+	if len(chunks) == 0 {
+		call(pSetTextColor, memDC, 0x808080)
+		call(pDrawTextW, memDC, uintptr(unsafe.Pointer(str(hintText))), ^uintptr(0), uintptr(unsafe.Pointer(&full)),
+			dtCenter|dtVCenter|dtSingleLine|dtNoPrefix)
+		call(pSetTextColor, memDC, 0xFFFFFF)
 	}
-	var start, end uint32
-	send(emGetSel, uintptr(unsafe.Pointer(&start)), uintptr(unsafe.Pointer(&end)))
-	pos := getScroll()
-	send(emSetSel, 0, ^uintptr(0))
-	send(emSetParaFormat, 0, uintptr(unsafe.Pointer(&pf)))
-	send(emSetSel, uintptr(start), uintptr(end))
-	setScroll(pos)
-}
-
-func updateDirection() {
-	if r := isRTL(getText()); r != rtl {
-		rtl = r
-		applyPara()
+	y := (bufH - lineH) / 2
+	for i := range chunks {
+		c := &chunks[i]
+		x := chunkX(c)
+		if x > bufW || x+int32(c.width) < 0 {
+			continue
+		}
+		if allSelected {
+			band := rect{x, y, x + int32(c.width), y + lineH}
+			call(pFillRect, memDC, uintptr(unsafe.Pointer(&band)), selBrush)
+		}
+		call(pScriptStringOut, c.ssa, uintptr(x), uintptr(y), 0, 0, 0, 0, 0)
 	}
+	blend := uintptr(255<<16 | 1<<24) // SourceConstantAlpha 255, AC_SRC_ALPHA
+	call(pGdiAlphaBlend, memDC, 0, 0, uintptr(fadeW), uintptr(bufH), fadeDC[0], 0, 0, uintptr(fadeW), 1, blend)
+	call(pGdiAlphaBlend, memDC, uintptr(bufW-fadeW), 0, uintptr(fadeW), uintptr(bufH), fadeDC[1], 0, 0, uintptr(fadeW), 1, blend)
 }
 
-func resizeBy(dw, dh int32) {
-	stopAnim()
-	r := windowRect()
-	w := clamp(r.Right-r.Left+dw, px(200), sm(0))
-	h := clamp(r.Bottom-r.Top+dh, px(40), sm(1))
-	x := (r.Left+r.Right)/2 - w/2
-	call(pSetWindowPos, hMain, 0, uintptr(x), uintptr(r.Top), uintptr(w), uintptr(h), swpNoZOrder|swpNoActivate)
-	layout()
+func present(hdc uintptr) {
+	ensureBuffer()
+	draw()
+	call(pBitBlt, hdc, 0, 0, uintptr(bufW), uintptr(bufH), memDC, 0, 0, srcCopy)
+}
+
+func render() {
+	if hMain == 0 {
+		return
+	}
+	hdc := call(pGetDC, hMain)
+	present(hdc)
+	call(pReleaseDC, hMain, hdc)
 }
 
 func startAnim() {
 	if animating {
 		return
 	}
-	curY = float64(getScroll())
-	targetY = curY
 	animating = true
+	target, vel = pos, 0
 	lastTick = time.Now()
 	call(pSetTimer, hMain, animTimer, 10, 0)
 }
@@ -461,43 +500,27 @@ func stopAnim() {
 	if animating {
 		call(pKillTimer, hMain, animTimer)
 	}
-	animating, hold, snapAtEnd = false, 0, false
+	animating, hold, vel = false, 0, 0
 }
 
-// Each tap glides to the next/previous line boundary; taps during a glide stack up.
-func stepLines(dir int) {
+func glideTo(p float64) {
 	startAnim()
-	targetY = clampScroll(nextBoundary(targetY, dir))
+	target = clampPos(p)
 }
 
-func scrollBy(dy float64) {
+func glideBy(d float64) {
 	startAnim()
-	targetY = clampScroll(targetY + dy)
-	snapAtEnd = true
+	target = clampPos(target + d)
 }
 
-func nearestBoundary(y float64) float64 {
-	down, up := nextBoundary(y-1, 1), nextBoundary(y+1, -1)
-	if down-y < y-up {
-		return down
+// A tap glides a third of the bar; key auto-repeat (a held arrow) switches to a steady glide.
+func move(dir int, vk, lp uintptr) {
+	if lp&(1<<30) == 0 {
+		glideBy(float64(dir) * step())
+	} else if hold == 0 {
+		startAnim()
+		hold, holdVK = dir, vk
 	}
-	return up
-}
-
-func releaseHold() {
-	if hold == 0 {
-		return
-	}
-	// Settle on the line boundary at or just past the glide position.
-	targetY = clampScroll(nextBoundary(targetY-float64(hold), hold))
-	hold = 0
-}
-
-func caretToTop() {
-	i := send(emLineIndex, send(emGetFirstVisibleLine, 0, 0), 0)
-	pos := getScroll()
-	send(emSetSel, i, i)
-	setScroll(pos)
 }
 
 func tick() {
@@ -505,51 +528,156 @@ func tick() {
 	dt := math.Min(now.Sub(lastTick).Seconds(), 0.05)
 	lastTick = now
 	if hold != 0 {
-		if !keyDown(holdVK) {
-			releaseHold()
+		if keyDown(holdVK) {
+			target = clampPos(target + float64(hold)*holdSpeedEms*float64(px(fontSize))*dt)
 		} else {
-			targetY = clampScroll(targetY + float64(hold)*holdLinesPerSec*lineHeight()*dt)
+			hold = 0
 		}
 	}
-	curY += (targetY - curY) * (1 - math.Exp(-dt/easeSeconds))
-	done := hold == 0 && math.Abs(targetY-curY) < 0.5
-	if done {
-		curY = targetY
+	// Critically damped spring: starts from rest, accelerates, settles without overshoot.
+	for t := 0.0; t < dt; t += 0.004 {
+		h := math.Min(0.004, dt-t)
+		vel += (springOmega*springOmega*(target-pos) - 2*springOmega*vel) * h
+		pos += vel * h
 	}
-	want := int32(math.Round(curY))
-	setScroll(want)
-	if got := getScroll(); got < want-1 || got > want+1 {
-		curY, targetY = float64(got), float64(got)
-		done = hold == 0
-	}
-	if done && snapAtEnd {
-		snapAtEnd = false
-		if b := clampScroll(nearestBoundary(targetY)); math.Abs(b-targetY) >= 1 {
-			targetY, done = b, false
-		}
-	}
-	if done {
+	if hold == 0 && math.Abs(target-pos) < 0.3 && math.Abs(vel) < 6 {
+		pos = target
 		stopAnim()
-		caretToTop()
+	}
+	render()
+}
+
+func setText(s string) {
+	stopAnim()
+	text = normalize(s)
+	allSelected = false
+	buildChunks()
+	pos, target = 0, 0
+	render()
+	call(pSetTimer, hMain, saveTimer, 500, 0)
+}
+
+func clipboardText() (string, bool) {
+	if call(pOpenClipboard, hMain) == 0 {
+		return "", false
+	}
+	defer call(pCloseClipboard)
+	h := call(pGetClipboardData, cfUnicodeText)
+	if h == 0 {
+		return "", false
+	}
+	p := call(pGlobalLock, h)
+	if p == 0 {
+		return "", false
+	}
+	defer call(pGlobalUnlock, h)
+	n := call(pLstrlenW, p)
+	buf := make([]uint16, n+1)
+	if n > 0 {
+		call(pRtlMoveMemory, uintptr(unsafe.Pointer(&buf[0])), p, n*2)
+	}
+	return syscall.UTF16ToString(buf), true
+}
+
+func copyText() {
+	buf, err := syscall.UTF16FromString(strings.ReplaceAll(text, "\n", "\r\n"))
+	if err != nil || call(pOpenClipboard, hMain) == 0 {
+		return
+	}
+	defer call(pCloseClipboard)
+	call(pEmptyClipboard)
+	size := uintptr(len(buf) * 2)
+	h := call(pGlobalAlloc, gmemMoveable, size)
+	if h == 0 {
+		return
+	}
+	call(pRtlMoveMemory, call(pGlobalLock, h), uintptr(unsafe.Pointer(&buf[0])), size)
+	call(pGlobalUnlock, h)
+	if call(pSetClipboardData, cfUnicodeText, h) == 0 {
+		call(pGlobalFree, h)
 	}
 }
 
-func selectAll() {
-	pos := getScroll()
-	send(emSetSel, 0, ^uintptr(0))
-	setScroll(pos)
+func paste() {
+	if s, ok := clipboardText(); ok {
+		setText(s)
+	}
 }
 
-// The view jumps to where the pasted text begins, so a fresh script always starts at its first line.
-func paste() {
-	stopAnim()
-	var start, end uint32
-	send(emGetSel, uintptr(unsafe.Pointer(&start)), uintptr(unsafe.Pointer(&end)))
-	send(wmPaste, 0, 0)
-	rtl = isRTL(getText())
-	applyPara()
-	send(emSetSel, uintptr(start), uintptr(start))
-	setScroll(lineTop(send(emExLineFromChar, 0, uintptr(start))) - lineTop(0))
+func resizeBy(dw, dh int32) {
+	r := windowRect()
+	w := clamp(r.Right-r.Left+dw, px(200), sm(0))
+	h := clamp(r.Bottom-r.Top+dh, px(40), sm(1))
+	x := (r.Left+r.Right)/2 - w/2
+	call(pSetWindowPos, hMain, 0, uintptr(x), uintptr(r.Top), uintptr(w), uintptr(h), swpNoZOrder|swpNoActivate)
+	ensureBuffer()
+	pos, target = clampPos(pos), clampPos(target)
+}
+
+func onKey(vk, lp uintptr) {
+	if vk == vkShift || vk == vkControl || vk == vkMenu {
+		return
+	}
+	wasSelected := allSelected
+	allSelected = false
+	if keyDown(vkControl) && !keyDown(vkMenu) {
+		switch vk {
+		case 'V':
+			paste()
+		case 'C':
+			copyText()
+			allSelected = wasSelected
+		case 'A':
+			allSelected = true
+		case vkOemPlus, vkAdd:
+			applyFont(fontSize + 2)
+		case vkOemMinus, vkSubtract:
+			applyFont(fontSize - 2)
+		case vkUp:
+			resizeBy(0, -px(10))
+		case vkDown:
+			resizeBy(0, px(10))
+		case vkLeft:
+			resizeBy(-px(40), 0)
+		case vkRight:
+			resizeBy(px(40), 0)
+		}
+		render()
+		return
+	}
+	rightward := -1
+	if rtl {
+		rightward = 1
+	}
+	switch vk {
+	case vkRight:
+		move(rightward, vk, lp)
+	case vkLeft:
+		move(-rightward, vk, lp)
+	case vkDown:
+		move(1, vk, lp)
+	case vkUp:
+		move(-1, vk, lp)
+	case vkNext:
+		glideBy(float64(bufW - 2*inset()))
+	case vkPrior:
+		glideBy(-float64(bufW - 2*inset()))
+	case vkEnd:
+		glideTo(maxPos())
+	case vkHome:
+		glideTo(0)
+	case vkDelete, vkBack:
+		if wasSelected {
+			setText("")
+		}
+	case vkInsert:
+		if keyDown(vkShift) {
+			paste()
+		}
+	case vkEscape:
+		call(pPostMessageW, hMain, wmClose, 0, 0)
+	}
+	render()
 }
 
 func dataPath(name string) string {
@@ -564,13 +692,13 @@ func dataPath(name string) string {
 
 func saveText() {
 	if p := dataPath("text.txt"); p != "" {
-		os.WriteFile(p, []byte(crlf(getText())), 0o644)
+		os.WriteFile(p, []byte(strings.ReplaceAll(text, "\n", "\r\n")), 0o644)
 	}
 }
 
 func saveSettings() {
 	r := windowRect()
-	b, _ := json.Marshal(config{r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, fontSize})
+	b, _ := json.Marshal(config{r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, fontSize, pos})
 	if p := dataPath("settings.json"); p != "" {
 		os.WriteFile(p, b, 0o644)
 	}
@@ -585,7 +713,7 @@ func loadSettings() (config, bool) {
 	vx, vy, vw, vh := sm(76), sm(77), sm(78), sm(79)
 	cx := c.X + c.W/2
 	onScreen := cx >= vx && cx <= vx+vw && c.Y >= vy && c.Y <= vy+vh-px(20)
-	return c, onScreen && c.W >= px(100) && c.H >= px(30) && c.Font >= 10
+	return c, onScreen && c.W >= px(100) && c.H >= px(30) && c.Font >= 12
 }
 
 func loadText() (string, bool) {
@@ -596,112 +724,44 @@ func loadText() (string, bool) {
 	return string(b), true
 }
 
-func viewHeight() float64 {
-	r := windowRect()
-	return float64(r.Bottom - r.Top - px(10))
-}
-
-// Returns true when the key was consumed.
-func handleKey(vk, lp uintptr) bool {
-	if keyDown(vkControl) && !keyDown(vkMenu) {
-		switch vk {
-		case 'A':
-			selectAll()
-		case 'C':
-			send(wmCopy, 0, 0)
-		case 'V':
-			paste()
-		case 'X':
-			send(wmCut, 0, 0)
-		case 'Z':
-			send(emUndo, 0, 0)
-		case 'Y':
-			send(emRedo, 0, 0)
-		case vkOemPlus, vkAdd:
-			applyFont(fontSize+2, cfmSize)
-		case vkOemMinus, vkSubtract:
-			applyFont(fontSize-2, cfmSize)
-		case vkUp:
-			resizeBy(0, -px(20))
-		case vkDown:
-			resizeBy(0, px(20))
-		case vkLeft:
-			resizeBy(-px(40), 0)
-		case vkRight:
-			resizeBy(px(40), 0)
-		case vkHome, vkEnd, vkPrior, vkNext, vkBack, vkDelete, vkInsert, vkShift, vkControl, vkMenu:
-			stopAnim()
-			return false
-		}
-		// Unlisted Ctrl shortcuts (bold, italic, alignment...) would restyle the whole script, so they are dropped.
-		return true
-	}
-	switch vk {
-	case vkLeft, vkUp, vkRight, vkDown:
-		dir := 1
-		if vk == vkLeft || vk == vkUp {
-			dir = -1
-		}
-		if lp&(1<<30) == 0 {
-			stepLines(dir)
-		} else if hold == 0 {
-			startAnim()
-			hold, holdVK = dir, vk
-		}
-	case vkInsert:
-		if !keyDown(vkShift) {
-			return false
-		}
-		paste()
-	case vkPrior:
-		scrollBy(-viewHeight())
-	case vkNext:
-		scrollBy(viewHeight())
-	case vkEscape:
-		call(pPostMessageW, hMain, wmClose, 0, 0)
-	default:
-		stopAnim()
-		return false
-	}
-	return true
-}
-
-func editProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
+func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 	switch msg {
+	case wmPaint:
+		var ps paintStruct
+		hdc := call(pBeginPaint, hwnd, uintptr(unsafe.Pointer(&ps)))
+		present(hdc)
+		call(pEndPaint, hwnd, uintptr(unsafe.Pointer(&ps)))
+		return 0
+	case wmEraseBkgnd:
+		return 1
 	case wmKeyDown:
-		if handleKey(wp, lp) {
-			return 0
-		}
+		onKey(wp, lp)
+		return 0
 	case wmKeyUp:
-		switch wp {
-		case vkLeft, vkUp, vkRight, vkDown:
-			if wp == holdVK {
-				releaseHold()
-			}
-			return 0
+		if hold != 0 && wp == holdVK {
+			hold = 0
 		}
+		return 0
 	case wmKillFocus:
-		releaseHold()
-	case wmChar:
-		// Ctrl shortcuts are handled on key-down; their control chars must not reach the control.
-		if wp == vkEscape || (keyDown(vkControl) && !keyDown(vkMenu)) {
-			return 0
-		}
+		hold = 0
 	case wmMouseWheel:
 		delta := float64(int16(wp >> 16))
 		if wp&mkControl != 0 {
 			if delta > 0 {
-				applyFont(fontSize+2, cfmSize)
+				applyFont(fontSize + 2)
 			} else {
-				applyFont(fontSize-2, cfmSize)
+				applyFont(fontSize - 2)
 			}
+			render()
 		} else {
-			scrollBy(-delta / 120 * lineHeight())
+			glideBy(-delta / 120 * step() / 2)
 		}
 		return 0
-	case wmLButtonDown:
-		stopAnim()
-	case wmRButtonDown:
+	case wmLButtonDown, wmRButtonDown:
+		if allSelected {
+			allSelected = false
+			render()
+		}
 		dragging = true
 		call(pSetCapture, hwnd)
 		call(pGetCursorPos, uintptr(unsafe.Pointer(&dragCursor)))
@@ -713,10 +773,10 @@ func editProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 			var p point
 			call(pGetCursorPos, uintptr(unsafe.Pointer(&p)))
 			x, y := dragWin.X+p.X-dragCursor.X, dragWin.Y+p.Y-dragCursor.Y
-			call(pSetWindowPos, hMain, 0, uintptr(x), uintptr(y), 0, 0, swpNoSize|swpNoZOrder|swpNoActivate)
-			return 0
+			call(pSetWindowPos, hwnd, 0, uintptr(x), uintptr(y), 0, 0, swpNoSize|swpNoZOrder|swpNoActivate)
 		}
-	case wmRButtonUp:
+		return 0
+	case wmLButtonUp, wmRButtonUp:
 		if dragging {
 			dragging = false
 			call(pReleaseCapture)
@@ -724,23 +784,6 @@ func editProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 		return 0
 	case wmCaptureChanged:
 		dragging = false
-	case wmContextMenu:
-		return 0
-	}
-	return call(pCallWindowProcW, origEditProc, hwnd, uintptr(msg), wp, lp)
-}
-
-func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
-	switch msg {
-	case wmSetFocus:
-		if hEdit != 0 {
-			call(pSetFocus, hEdit)
-		}
-		return 0
-	case wmCommand:
-		if lp == hEdit && (wp>>16)&0xFFFF == enChange {
-			call(pSetTimer, hwnd, saveTimer, 800, 0)
-		}
 		return 0
 	case wmTimer:
 		switch wp {
@@ -751,7 +794,6 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 		case saveTimer:
 			call(pKillTimer, hwnd, saveTimer)
 			saveText()
-			updateDirection()
 		}
 		return 0
 	case wmClose:
@@ -770,17 +812,15 @@ func main() {
 	if pSetProcessDPIAware.Find() == nil {
 		call(pSetProcessDPIAware)
 	}
-	hdc := call(pGetDC, 0)
-	if dpi := call(pGetDeviceCaps, hdc, 90); dpi > 0 {
+	screen := call(pGetDC, 0)
+	if dpi := call(pGetDeviceCaps, screen, 90); dpi > 0 {
 		scale = float64(dpi) / 96
 	}
-	call(pReleaseDC, 0, hdc)
-	if _, err := syscall.LoadLibrary("Msftedit.dll"); err != nil {
-		return
-	}
+	call(pReleaseDC, 0, screen)
 
 	hInst := call(pGetModuleHandleW, 0)
 	bgBrush = call(pCreateSolidBrush, 0)
+	selBrush = call(pCreateSolidBrush, 0x00B4641E)
 	cls := str("TeleprompterBar")
 	wc := wndClassExW{
 		cbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
@@ -795,37 +835,31 @@ func main() {
 	sw := sm(0)
 	w, h := sw*2/5, px(80)
 	x, y := (sw-w)/2, int32(0)
-	if c, ok := loadSettings(); ok {
-		x, y, w, h, fontSize = c.X, c.Y, c.W, c.H, c.Font
+	cfg, haveCfg := loadSettings()
+	if haveCfg {
+		x, y, w, h, fontSize = cfg.X, cfg.Y, cfg.W, cfg.H, cfg.Font
 	}
 
 	hMain = call(pCreateWindowExW, wsExLayered|wsExTopmost, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(str("Teleprompter"))),
 		wsPopup, uintptr(x), uintptr(y), uintptr(w), uintptr(h), 0, 0, hInst, 0)
 	call(pSetLayeredWindowAttributes, hMain, 0, opacity, lwaAlpha)
 
-	hEdit = call(pCreateWindowExW, 0, uintptr(unsafe.Pointer(str("RICHEDIT50W"))), 0,
-		wsChild|wsVisible|esMultiline|esAutoVScroll, 0, 0, uintptr(w), uintptr(h), hMain, 1, hInst, 0)
-	if hEdit == 0 {
-		return
-	}
-	send(emSetTextMode, tmPlainText|tmMultiLevelUndo|tmMultiCodePage, 0)
-	send(emExLimitText, 0, 1<<26)
-	send(emSetBkgndColor, 0, 0)
-	send(emSetEventMask, 0, enmChange)
-	origEditProc = call(pSetWindowLongPtrW, hEdit, uintptr(gwlpWndProc), syscall.NewCallback(editProc))
-	applyFont(fontSize, cfmSize|cfmColor|cfmFace|cfmBold)
+	memDC = call(pCreateCompatibleDC, 0)
+	call(pSetBkMode, memDC, bkTransparent)
+	call(pSetTextColor, memDC, 0xFFFFFF)
+	fadeW = px(40)
+	fadeDC = [2]uintptr{makeFade(true), makeFade(false)}
+	ensureBuffer()
 
-	text, saved := loadText()
+	s, saved := loadText()
 	if !saved {
-		text = helpText
+		s = helpText
 	}
-	call(pSetWindowTextW, hEdit, uintptr(unsafe.Pointer(str(crlf(text)))))
-	rtl = isRTL(text)
-	applyPara()
-	send(emSetSel, 0, 0)
-	setScroll(0)
-	if !saved {
-		selectAll()
+	text = normalize(s)
+	applyFont(fontSize)
+	if haveCfg {
+		pos = clampPos(cfg.Pos)
+		target = pos
 	}
 
 	call(pShowWindow, hMain, 5)
@@ -833,7 +867,8 @@ func main() {
 		call(pSetWindowDisplayAffinity, hMain, wdaExcludeFromCapture)
 	}
 	call(pSetForegroundWindow, hMain)
-	call(pSetFocus, hEdit)
+	call(pSetFocus, hMain)
+	render()
 
 	var m msgT
 	for int32(call(pGetMessageW, uintptr(unsafe.Pointer(&m)), 0, 0, 0)) > 0 {
