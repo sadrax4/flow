@@ -7,7 +7,7 @@
 
     $name = 'Teleprompter'
     $version = '1.0.0'
-    $url = 'https://github.com/sadrax4/flow/releases/latest/download/Teleprompter.exe'
+    $url = 'https://raw.githubusercontent.com/sadrax4/flow/main/Teleprompter.exe'
     $dir = Join-Path $env:LOCALAPPDATA "Programs\$name"
     $exe = Join-Path $dir "$name.exe"
     $links = @(
