@@ -73,6 +73,7 @@ const (
 	dtNoPrefix    = 0x0800
 
 	swpNoSize     = 0x0001
+	swpNoMove     = 0x0002
 	swpNoZOrder   = 0x0004
 	swpNoActivate = 0x0010
 
@@ -436,10 +437,16 @@ func applyFont(size int32) {
 	var tm [16]int32
 	call(pGetTextMetricsW, memDC, uintptr(unsafe.Pointer(&tm[0])))
 	lineH = tm[0]
+	// The bar hugs one line of text so it sits flush under the top edge of the screen.
+	r := windowRect()
+	call(pSetWindowPos, hMain, 0, 0, 0, uintptr(r.Right-r.Left), uintptr(lineH+2*textMargin()), swpNoMove|swpNoZOrder|swpNoActivate)
+	ensureBuffer()
 	buildChunks()
 	pos = clampPos(keep * total)
 	target = pos
 }
+
+func textMargin() int32 { return px(3) }
 
 func makeFade(opaqueLeft bool) uintptr {
 	bi := bitmapInfo{biSize: 40, biWidth: fadeW, biHeight: 1, biPlanes: 1, biBitCount: 32}
@@ -475,8 +482,9 @@ func ensureBuffer() {
 		call(pDeleteObject, memBmp)
 	}
 	memBmp, bufW, bufH = bmp, w, h
-	rad := uintptr(px(28))
-	call(pSetWindowRgn, hMain, call(pCreateRoundRectRgn, 0, 0, uintptr(w+1), uintptr(h+1), rad, rad), 1)
+	// Region starts above the window so only the bottom corners are rounded, like a notch under the camera.
+	rad := px(24)
+	call(pSetWindowRgn, hMain, call(pCreateRoundRectRgn, 0, uintptr(-rad), uintptr(w+1), uintptr(h+1), uintptr(rad), uintptr(rad)), 1)
 }
 
 func draw() {
@@ -488,7 +496,7 @@ func draw() {
 			dtCenter|dtVCenter|dtSingleLine|dtNoPrefix)
 		call(pSetTextColor, memDC, 0xFFFFFF)
 	}
-	y := (bufH - lineH) / 2
+	y := textMargin()
 	for i := range chunks {
 		c := &chunks[i]
 		x := chunkX(c)
@@ -662,12 +670,11 @@ func paste() {
 	}
 }
 
-func resizeBy(dw, dh int32) {
+func resizeWidth(dw int32) {
 	r := windowRect()
 	w := clamp(r.Right-r.Left+dw, px(200), sm(0))
-	h := clamp(r.Bottom-r.Top+dh, px(40), sm(1))
 	x := (r.Left+r.Right)/2 - w/2
-	call(pSetWindowPos, hMain, 0, uintptr(x), uintptr(r.Top), uintptr(w), uintptr(h), swpNoZOrder|swpNoActivate)
+	call(pSetWindowPos, hMain, 0, uintptr(x), uintptr(r.Top), uintptr(w), uintptr(r.Bottom-r.Top), swpNoZOrder|swpNoActivate)
 	ensureBuffer()
 	pos, target = clampPos(pos), clampPos(target)
 }
@@ -687,18 +694,14 @@ func onKey(vk, lp uintptr) {
 			allSelected = wasSelected
 		case 'A':
 			allSelected = true
-		case vkOemPlus, vkAdd:
+		case vkOemPlus, vkAdd, vkUp:
 			applyFont(fontSize + 2)
-		case vkOemMinus, vkSubtract:
+		case vkOemMinus, vkSubtract, vkDown:
 			applyFont(fontSize - 2)
-		case vkUp:
-			resizeBy(0, -px(10))
-		case vkDown:
-			resizeBy(0, px(10))
 		case vkLeft:
-			resizeBy(-px(40), 0)
+			resizeWidth(-px(40))
 		case vkRight:
-			resizeBy(px(40), 0)
+			resizeWidth(px(40))
 		}
 		render()
 		return
@@ -773,7 +776,7 @@ func loadSettings() (config, bool) {
 	vx, vy, vw, vh := sm(76), sm(77), sm(78), sm(79)
 	cx := c.X + c.W/2
 	onScreen := cx >= vx && cx <= vx+vw && c.Y >= vy && c.Y <= vy+vh-px(20)
-	return c, onScreen && c.W >= px(100) && c.H >= px(30) && c.Font >= 12
+	return c, onScreen && c.W >= px(100) && c.Font >= 12
 }
 
 func loadText() (string, bool) {
