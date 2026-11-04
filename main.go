@@ -85,7 +85,8 @@ const (
 
 	omegaSlow     = 7.0  // taps, held arrows, wheel: a calm ~0.8s glide
 	omegaFast     = 22.0 // sentence and page jumps
-	holdSpeedEms  = 4.0
+	holdSpeedEms  = 5.0
+	tapTime       = 180 * time.Millisecond
 	configVersion = 2
 	separator     = "   •   "
 	hintText      = "Ctrl+V  =  paste your text"
@@ -261,6 +262,8 @@ var (
 	pos, target, vel float64
 	omega            = omegaSlow
 	hold             int
+	holdStart        time.Time
+	holdOrigin       float64
 	holdVK           uintptr
 	lastTick         time.Time
 
@@ -556,15 +559,28 @@ func glideTo(p, w float64) {
 
 func glideBy(d, w float64) { glideTo(target+d, w) }
 
-// A tap glides a quarter of the bar; key auto-repeat (a held arrow) switches to a steady glide.
+// The glide starts the moment the arrow goes down; auto-repeat key-downs are ignored.
 func move(dir int, vk, lp uintptr) {
-	if lp&(1<<30) == 0 {
-		glideBy(float64(dir)*step(), omegaSlow)
-	} else if hold == 0 {
-		startAnim()
-		omega = omegaSlow
-		hold, holdVK = dir, vk
+	if lp&(1<<30) != 0 {
+		return
 	}
+	startAnim()
+	omega = omegaSlow
+	hold, holdVK = dir, vk
+	holdStart, holdOrigin = time.Now(), target
+}
+
+// A short press counts as a tap and completes a quarter-bar step; a long press just stops gliding.
+func releaseHold() {
+	if hold == 0 {
+		return
+	}
+	if time.Since(holdStart) < tapTime {
+		if t := holdOrigin + float64(hold)*step(); (t-target)*float64(hold) > 0 {
+			target = clampPos(t)
+		}
+	}
+	hold = 0
 }
 
 // Up goes to the start of the current sentence (or the previous one if already there); Down to the next.
@@ -599,7 +615,7 @@ func tick() {
 		if keyDown(holdVK) {
 			target = clampPos(target + float64(hold)*holdSpeedEms*float64(px(fontSize))*dt)
 		} else {
-			hold = 0
+			releaseHold()
 		}
 	}
 	// Critically damped spring: starts from rest, accelerates, settles without overshoot.
@@ -804,11 +820,11 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 		return 0
 	case wmKeyUp:
 		if hold != 0 && wp == holdVK {
-			hold = 0
+			releaseHold()
 		}
 		return 0
 	case wmKillFocus:
-		hold = 0
+		releaseHold()
 	case wmMouseWheel:
 		delta := float64(int16(wp >> 16))
 		if wp&mkControl != 0 {
