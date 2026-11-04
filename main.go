@@ -82,14 +82,17 @@ const (
 	saveTimer             = 2
 	opacity               = 217
 
-	springOmega  = 14.0
-	holdSpeedEms = 8.0
-	separator    = "   •   "
-	hintText     = "Ctrl+V  =  paste your text"
+	omegaSlow     = 7.0  // taps, held arrows, wheel: a calm ~0.8s glide
+	omegaFast     = 22.0 // sentence and page jumps
+	holdSpeedEms  = 4.0
+	configVersion = 2
+	separator     = "   •   "
+	hintText      = "Ctrl+V  =  paste your text"
 )
 
 const helpText = "Ctrl+V = paste your text\n" +
 	"Right / Left arrow = move the text (hold to glide)\n" +
+	"Up / Down arrow = jump to previous / next sentence\n" +
 	"Ctrl + / Ctrl - = text size\n" +
 	"Ctrl + arrows = bar size\n" +
 	"Drag = move the bar\n" +
@@ -148,12 +151,19 @@ type bitmapInfo struct {
 
 // One shaped run of the script; the whole script is laid out as a single line of these.
 type chunk struct {
-	ssa          uintptr
-	buf          []uint16
-	start, width float64
+	ssa           uintptr
+	buf           []uint16
+	start, width  float64
+	sentenceStart bool
+}
+
+type piece struct {
+	text          string
+	sentenceStart bool
 }
 
 type config struct {
+	V                int
 	X, Y, W, H, Font int32
 	Pos              float64
 }
@@ -237,7 +247,7 @@ var (
 	fadeDC                        [2]uintptr
 	bufW, bufH, fadeW, lineH      int32
 	scale                               = 1.0
-	fontSize                      int32 = 36
+	fontSize                      int32 = 24
 
 	text        string
 	chunks      []chunk
@@ -247,6 +257,7 @@ var (
 
 	animating        bool
 	pos, target, vel float64
+	omega            = omegaSlow
 	hold             int
 	holdVK           uintptr
 	lastTick         time.Time
@@ -303,31 +314,55 @@ func isRTL(s string) bool {
 	return rtlCount > ltrCount
 }
 
-// Paragraphs joined by a separator, cut at spaces into runs small enough to shape quickly.
-func pieces(s string) []string {
-	var paras, out []string
+// Splits after sentence-ending punctuation that is followed by a space.
+func sentences(p string) []string {
+	var out []string
+	start := 0
+	prevEnd := false
+	for i, r := range p {
+		if prevEnd && r == ' ' {
+			out = append(out, p[start:i+1])
+			start = i + 1
+		}
+		prevEnd = strings.ContainsRune(".!?؟…", r)
+	}
+	if start < len(p) {
+		out = append(out, p[start:])
+	}
+	return out
+}
+
+// Paragraphs joined by a separator, one run per sentence (long ones cut at spaces) so runs shape quickly
+// and sentence starts are known for the Up/Down jumps.
+func pieces(s string) []piece {
+	var paras []string
+	var out []piece
 	for _, p := range strings.Split(s, "\n") {
 		if p = strings.Join(strings.Fields(p), " "); p != "" {
 			paras = append(paras, p)
 		}
 	}
-	for i, p := range paras {
+	for i, para := range paras {
+		sents := sentences(para)
 		if i < len(paras)-1 {
-			p += separator
+			sents[len(sents)-1] += separator
 		}
-		for p != "" {
-			cut := len(p)
-			if cut > 600 {
-				cut = strings.LastIndex(p[:600], " ") + 1
-				if cut <= 0 {
-					cut = 600
-					for cut > 0 && !utf8.RuneStart(p[cut]) {
-						cut--
+		for _, p := range sents {
+			first := true
+			for p != "" {
+				cut := len(p)
+				if cut > 600 {
+					cut = strings.LastIndex(p[:600], " ") + 1
+					if cut <= 0 {
+						cut = 600
+						for cut > 0 && !utf8.RuneStart(p[cut]) {
+							cut--
+						}
 					}
 				}
+				out = append(out, piece{p[:cut], first})
+				p, first = p[cut:], false
 			}
-			out = append(out, p[:cut])
-			p = p[cut:]
 		}
 	}
 	return out
@@ -350,8 +385,8 @@ func buildChunks() {
 		flags |= ssaRTL
 		statePtr = uintptr(unsafe.Pointer(&rtlState))
 	}
-	for _, piece := range pieces(text) {
-		buf, err := syscall.UTF16FromString(piece)
+	for _, pc := range pieces(text) {
+		buf, err := syscall.UTF16FromString(pc.text)
 		n := len(buf) - 1
 		if err != nil || n <= 0 {
 			continue
@@ -364,7 +399,7 @@ func buildChunks() {
 		}
 		var size point
 		call(pRtlMoveMemory, uintptr(unsafe.Pointer(&size)), call(pScriptStringPSize, ssa), 8)
-		chunks = append(chunks, chunk{ssa: ssa, buf: buf, start: total, width: float64(size.X)})
+		chunks = append(chunks, chunk{ssa: ssa, buf: buf, start: total, width: float64(size.X), sentenceStart: pc.sentenceStart})
 		total += float64(size.X)
 	}
 }
@@ -375,7 +410,7 @@ func maxPos() float64 { return math.Max(0, total-float64(bufW-2*inset())) }
 
 func clampPos(p float64) float64 { return math.Max(0, math.Min(p, maxPos())) }
 
-func step() float64 { return float64(bufW-2*inset()) / 3 }
+func step() float64 { return float64(bufW-2*inset()) / 4 }
 
 // pos grows in reading order; RTL text starts at the right edge and advances by moving right.
 func chunkX(c *chunk) int32 {
@@ -503,24 +538,47 @@ func stopAnim() {
 	animating, hold, vel = false, 0, 0
 }
 
-func glideTo(p float64) {
+func glideTo(p, w float64) {
 	startAnim()
+	omega = w
 	target = clampPos(p)
 }
 
-func glideBy(d float64) {
-	startAnim()
-	target = clampPos(target + d)
-}
+func glideBy(d, w float64) { glideTo(target+d, w) }
 
-// A tap glides a third of the bar; key auto-repeat (a held arrow) switches to a steady glide.
+// A tap glides a quarter of the bar; key auto-repeat (a held arrow) switches to a steady glide.
 func move(dir int, vk, lp uintptr) {
 	if lp&(1<<30) == 0 {
-		glideBy(float64(dir) * step())
+		glideBy(float64(dir)*step(), omegaSlow)
 	} else if hold == 0 {
 		startAnim()
+		omega = omegaSlow
 		hold, holdVK = dir, vk
 	}
+}
+
+// Up goes to the start of the current sentence (or the previous one if already there); Down to the next.
+func jumpSentence(dir int) {
+	startAnim()
+	if dir > 0 {
+		dest := maxPos()
+		for _, c := range chunks {
+			if c.sentenceStart && c.start > target+2 {
+				dest = c.start
+				break
+			}
+		}
+		glideTo(dest, omegaFast)
+		return
+	}
+	dest := 0.0
+	for i := len(chunks) - 1; i >= 0; i-- {
+		if c := chunks[i]; c.sentenceStart && c.start < target-2 {
+			dest = c.start
+			break
+		}
+	}
+	glideTo(dest, omegaFast)
 }
 
 func tick() {
@@ -537,7 +595,7 @@ func tick() {
 	// Critically damped spring: starts from rest, accelerates, settles without overshoot.
 	for t := 0.0; t < dt; t += 0.004 {
 		h := math.Min(0.004, dt-t)
-		vel += (springOmega*springOmega*(target-pos) - 2*springOmega*vel) * h
+		vel += (omega*omega*(target-pos) - 2*omega*vel) * h
 		pos += vel * h
 	}
 	if hold == 0 && math.Abs(target-pos) < 0.3 && math.Abs(vel) < 6 {
@@ -655,17 +713,17 @@ func onKey(vk, lp uintptr) {
 	case vkLeft:
 		move(-rightward, vk, lp)
 	case vkDown:
-		move(1, vk, lp)
+		jumpSentence(1)
 	case vkUp:
-		move(-1, vk, lp)
+		jumpSentence(-1)
 	case vkNext:
-		glideBy(float64(bufW - 2*inset()))
+		glideBy(float64(bufW-2*inset()), omegaFast)
 	case vkPrior:
-		glideBy(-float64(bufW - 2*inset()))
+		glideBy(-float64(bufW-2*inset()), omegaFast)
 	case vkEnd:
-		glideTo(maxPos())
+		glideTo(maxPos(), omegaFast)
 	case vkHome:
-		glideTo(0)
+		glideTo(0, omegaFast)
 	case vkDelete, vkBack:
 		if wasSelected {
 			setText("")
@@ -698,7 +756,7 @@ func saveText() {
 
 func saveSettings() {
 	r := windowRect()
-	b, _ := json.Marshal(config{r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, fontSize, pos})
+	b, _ := json.Marshal(config{configVersion, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, fontSize, pos})
 	if p := dataPath("settings.json"); p != "" {
 		os.WriteFile(p, b, 0o644)
 	}
@@ -707,7 +765,8 @@ func saveSettings() {
 func loadSettings() (config, bool) {
 	var c config
 	b, err := os.ReadFile(dataPath("settings.json"))
-	if err != nil || json.Unmarshal(b, &c) != nil {
+	// Layouts saved by older versions are dropped so new default sizes take effect.
+	if err != nil || json.Unmarshal(b, &c) != nil || c.V != configVersion {
 		return c, false
 	}
 	vx, vy, vw, vh := sm(76), sm(77), sm(78), sm(79)
@@ -754,7 +813,7 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 			}
 			render()
 		} else {
-			glideBy(-delta / 120 * step() / 2)
+			glideBy(-delta/120*step()/2, omegaSlow)
 		}
 		return 0
 	case wmLButtonDown, wmRButtonDown:
@@ -833,7 +892,7 @@ func main() {
 	call(pRegisterClassExW, uintptr(unsafe.Pointer(&wc)))
 
 	sw := sm(0)
-	w, h := sw*2/5, px(80)
+	w, h := sw*3/10, px(60)
 	x, y := (sw-w)/2, int32(0)
 	cfg, haveCfg := loadSettings()
 	if haveCfg {
@@ -847,7 +906,7 @@ func main() {
 	memDC = call(pCreateCompatibleDC, 0)
 	call(pSetBkMode, memDC, bkTransparent)
 	call(pSetTextColor, memDC, 0xFFFFFF)
-	fadeW = px(40)
+	fadeW = px(32)
 	fadeDC = [2]uintptr{makeFade(true), makeFade(false)}
 	ensureBuffer()
 
