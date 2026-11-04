@@ -198,6 +198,7 @@ var (
 	pGetCursorPos               = user32.NewProc("GetCursorPos")
 	pGetKeyState                = user32.NewProc("GetKeyState")
 	pLoadCursorW                = user32.NewProc("LoadCursorW")
+	pLoadImageW                 = user32.NewProc("LoadImageW")
 	pSetFocus                   = user32.NewProc("SetFocus")
 	pSetTimer                   = user32.NewProc("SetTimer")
 	pKillTimer                  = user32.NewProc("KillTimer")
@@ -891,6 +892,8 @@ func main() {
 		lpfnWndProc:   syscall.NewCallback(mainProc),
 		hInstance:     hInst,
 		hCursor:       call(pLoadCursorW, 0, 32512),
+		hIcon:         call(pLoadImageW, hInst, 1, 1, uintptr(sm(11)), uintptr(sm(12)), 0), // icon resource 1, SM_CXICON
+		hIconSm:       call(pLoadImageW, hInst, 1, 1, uintptr(sm(49)), uintptr(sm(50)), 0), // SM_CXSMICON
 		hbrBackground: bgBrush,
 		lpszClassName: cls,
 	}
