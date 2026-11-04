@@ -703,15 +703,16 @@ func onKey(vk, lp uintptr) {
 		render()
 		return
 	}
-	rightward := -1
+	// Right arrow slides the text left (the view moves right), whatever the script direction.
+	slideLeft := 1
 	if rtl {
-		rightward = 1
+		slideLeft = -1
 	}
 	switch vk {
 	case vkRight:
-		move(rightward, vk, lp)
+		move(slideLeft, vk, lp)
 	case vkLeft:
-		move(-rightward, vk, lp)
+		move(-slideLeft, vk, lp)
 	case vkDown:
 		jumpSentence(1)
 	case vkUp:
