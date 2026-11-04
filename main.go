@@ -87,7 +87,7 @@ const (
 	omegaFast     = 22.0 // sentence and page jumps
 	holdSpeedEms  = 5.0
 	tapTime       = 180 * time.Millisecond
-	configVersion = 2
+	configVersion = 3
 	separator     = "   •   "
 	hintText      = "Ctrl+V  =  paste your text"
 )
@@ -787,8 +787,8 @@ func saveSettings() {
 func loadSettings() (config, bool) {
 	var c config
 	b, err := os.ReadFile(dataPath("settings.json"))
-	// Layouts saved by older versions are dropped so new default sizes take effect.
-	if err != nil || json.Unmarshal(b, &c) != nil || c.V != configVersion {
+	// Version 1 layouts are dropped entirely; version 2 keeps everything but the width (see main).
+	if err != nil || json.Unmarshal(b, &c) != nil || c.V < 2 {
 		return c, false
 	}
 	vx, vy, vw, vh := sm(76), sm(77), sm(78), sm(79)
@@ -916,11 +916,14 @@ func main() {
 	call(pRegisterClassExW, uintptr(unsafe.Pointer(&wc)))
 
 	sw := sm(0)
-	w, h := sw*3/10, px(60)
+	w, h := sw*22/100, px(60)
 	x, y := (sw-w)/2, int32(0)
 	cfg, haveCfg := loadSettings()
 	if haveCfg {
-		x, y, w, h, fontSize = cfg.X, cfg.Y, cfg.W, cfg.H, cfg.Font
+		y, fontSize = cfg.Y, cfg.Font
+		if cfg.V == configVersion {
+			x, w = cfg.X, cfg.W
+		}
 	}
 
 	hMain = call(pCreateWindowExW, wsExLayered|wsExTopmost, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(str("Teleprompter"))),
