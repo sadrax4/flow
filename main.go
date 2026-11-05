@@ -841,23 +841,9 @@ func checkPassword(p string) bool {
 	return err == nil && subtle.ConstantTimeCompare(got, want) == 1
 }
 
-// Proof of a past unlock, tied to this Windows user and computer so copying the file elsewhere does not unlock.
-func unlockToken() string {
-	sum := sha256.Sum256([]byte(passwordKey + "|" + os.Getenv("COMPUTERNAME") + "|" + os.Getenv("USERNAME")))
-	return hex.EncodeToString(sum[:])
-}
-
-func rememberedUnlock() bool {
-	b, err := os.ReadFile(dataPath("unlock"))
-	return err == nil && strings.TrimSpace(string(b)) == unlockToken()
-}
-
 func submitPassword() {
 	if checkPassword(string(password)) {
 		locked, password = false, nil
-		if p := dataPath("unlock"); p != "" {
-			os.WriteFile(p, []byte(unlockToken()), 0o644)
-		}
 	} else {
 		password = nil
 		showToast("Wrong password", colorError, 1500*time.Millisecond)
@@ -1179,7 +1165,9 @@ func main() {
 			speed = cfg.Speed
 		}
 	}
-	locked = !rememberedUnlock()
+	// The password is asked on every launch; an unlock file left by version 1.1.0 is removed.
+	locked = true
+	os.Remove(dataPath("unlock"))
 
 	hMain = call(pCreateWindowExW, wsExLayered|wsExTopmost, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(str("Teleprompter"))),
 		wsPopup, uintptr(x), uintptr(y), uintptr(w), uintptr(h), 0, 0, hInst, 0)
