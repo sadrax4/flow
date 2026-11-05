@@ -1,11 +1,16 @@
 package main
 
 import (
+	"crypto/pbkdf2"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,8 +31,10 @@ const (
 	wmPaint          = 0x000F
 	wmClose          = 0x0010
 	wmEraseBkgnd     = 0x0014
+	wmEndSession     = 0x0016
 	wmKeyDown        = 0x0100
 	wmKeyUp          = 0x0101
+	wmChar           = 0x0102
 	wmTimer          = 0x0113
 	wmMouseMove      = 0x0200
 	wmLButtonDown    = 0x0201
@@ -70,7 +77,10 @@ const (
 	dtCenter      = 0x0001
 	dtVCenter     = 0x0004
 	dtSingleLine  = 0x0020
+	dtCalcRect    = 0x0400
 	dtNoPrefix    = 0x0800
+
+	errAlreadyExists = 183
 
 	swpNoSize     = 0x0001
 	swpNoMove     = 0x0002
@@ -81,22 +91,42 @@ const (
 	wdaExcludeFromCapture = 0x11
 	animTimer             = 1
 	saveTimer             = 2
+	toastTimer            = 3
 	opacity               = 217
 
-	omegaSlow     = 7.0  // taps, held arrows, wheel: a calm ~0.8s glide
+	omegaSlow     = 7.0  // taps, held arrows, wheel: a calm ~0.8s glide at the default speed
 	omegaFast     = 22.0 // sentence and page jumps
-	holdSpeedEms  = 5.0
 	tapTime       = 180 * time.Millisecond
+	minSpeed      = 1 // held-arrow glide speed, in font-heights per second
+	maxSpeed      = 12
+	defaultSpeed  = 5
 	configVersion = 3
 	separator     = "   •   "
 	hintText      = "Ctrl+V  =  paste your text"
+	maxPassword   = 64
+	maxTextBytes  = 1 << 20
+	largeText     = 100_000 // bytes; above this "Loading..." is shown while shaping
+
+	colorText   = 0xFFFFFF // COLORREF is 0x00BBGGRR
+	colorDim    = 0xA0A0A0
+	colorError  = 0x5A5AFF
+	colorWarn   = 0x4FC8FF
+	colorAccent = 0xE0C060
+)
+
+// PBKDF2-SHA256 (200k rounds) of the unlock password; the password itself is not stored anywhere.
+const (
+	passwordSalt   = "c51f62f616066ed66722dd9d9ea99e58"
+	passwordKey    = "9261c9813b79d7b7a7647f4321be3ff6a8f7922f8273fb7c873044c12e5d13ac"
+	passwordRounds = 200000
 )
 
 const helpText = "Ctrl+V = paste your text\n" +
 	"Right / Left arrow = move the text (hold to glide)\n" +
 	"Up / Down arrow = jump to previous / next sentence\n" +
-	"Ctrl + / Ctrl - = text size\n" +
-	"Ctrl + arrows = bar size\n" +
+	"+ / - = speed\n" +
+	"Ctrl + Up / Down = text and bar height\n" +
+	"Ctrl + Left / Right = bar width\n" +
 	"Drag = move the bar\n" +
 	"Esc = close"
 
@@ -168,6 +198,7 @@ type config struct {
 	V                int
 	X, Y, W, H, Font int32
 	Pos              float64
+	Speed            int
 }
 
 var (
@@ -175,6 +206,7 @@ var (
 	gdi32    = syscall.NewLazyDLL("gdi32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 	usp10    = syscall.NewLazyDLL("usp10.dll")
+	dwmapi   = syscall.NewLazyDLL("dwmapi.dll")
 
 	pRegisterClassExW           = user32.NewProc("RegisterClassExW")
 	pCreateWindowExW            = user32.NewProc("CreateWindowExW")
@@ -214,6 +246,7 @@ var (
 	pEmptyClipboard             = user32.NewProc("EmptyClipboard")
 	pGetClipboardData           = user32.NewProc("GetClipboardData")
 	pSetClipboardData           = user32.NewProc("SetClipboardData")
+	pFindWindowW                = user32.NewProc("FindWindowW")
 
 	pCreateSolidBrush       = gdi32.NewProc("CreateSolidBrush")
 	pCreateRoundRectRgn     = gdi32.NewProc("CreateRoundRectRgn")
@@ -229,14 +262,18 @@ var (
 	pSetBkMode              = gdi32.NewProc("SetBkMode")
 	pGetTextMetricsW        = gdi32.NewProc("GetTextMetricsW")
 	pGetDeviceCaps          = gdi32.NewProc("GetDeviceCaps")
+	pGdiFlush               = gdi32.NewProc("GdiFlush")
 
 	pGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
 	pGlobalAlloc      = kernel32.NewProc("GlobalAlloc")
 	pGlobalFree       = kernel32.NewProc("GlobalFree")
 	pGlobalLock       = kernel32.NewProc("GlobalLock")
 	pGlobalUnlock     = kernel32.NewProc("GlobalUnlock")
-	pLstrlenW         = kernel32.NewProc("lstrlenW")
+	pGlobalSize       = kernel32.NewProc("GlobalSize")
 	pRtlMoveMemory    = kernel32.NewProc("RtlMoveMemory")
+	pCreateMutexW     = kernel32.NewProc("CreateMutexW")
+
+	pDwmFlush = dwmapi.NewProc("DwmFlush")
 
 	pScriptStringAnalyse = usp10.NewProc("ScriptStringAnalyse")
 	pScriptStringOut     = usp10.NewProc("ScriptStringOut")
@@ -246,7 +283,7 @@ var (
 
 var (
 	hMain, memDC, memBmp, curFont uintptr
-	bgBrush, selBrush             uintptr
+	bgBrush, selBrush, toastBrush uintptr
 	fadeDC                        [2]uintptr
 	bufW, bufH, fadeW, lineH      int32
 	scale                               = 1.0
@@ -269,6 +306,16 @@ var (
 
 	dragging            bool
 	dragCursor, dragWin point
+
+	speed = defaultSpeed
+
+	locked   bool
+	loading  bool
+	password []rune
+
+	toast      string
+	toastColor uintptr
+	toastUntil time.Time
 
 	rtlState uint16 = 1 // package-level so its address stays fixed while Uniscribe reads it
 )
@@ -299,7 +346,7 @@ func windowRect() rect {
 }
 
 func normalize(s string) string {
-	s = strings.ReplaceAll(s, "\x00", "")
+	s = strings.NewReplacer("\x00", "", "\uFEFF", "").Replace(s)
 	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
 }
 
@@ -430,7 +477,14 @@ func applyFont(size int32) {
 	if total > 0 {
 		keep = pos / total
 	}
-	freeChunks()
+	freeChunks() // before the old font is deleted: the shaped runs reference it
+	setFont(size)
+	buildChunks()
+	pos = clampPos(keep * total)
+	target = pos
+}
+
+func setFont(size int32) {
 	fontSize = clamp(size, 12, 200)
 	f := call(pCreateFontW, uintptr(-px(fontSize)), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(str("Segoe UI"))))
 	call(pSelectObject, memDC, f)
@@ -445,9 +499,18 @@ func applyFont(size int32) {
 	r := windowRect()
 	call(pSetWindowPos, hMain, 0, 0, 0, uintptr(r.Right-r.Left), uintptr(lineH+bottomMargin()), swpNoMove|swpNoZOrder|swpNoActivate)
 	ensureBuffer()
-	buildChunks()
-	pos = clampPos(keep * total)
-	target = pos
+}
+
+// Keeps shaping time to a couple of seconds (about 1M English or 500k Persian characters).
+func limitText(s string) (string, bool) {
+	if len(s) <= maxTextBytes {
+		return s, false
+	}
+	cut := maxTextBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut], true
 }
 
 // Text sits at the very top of the bar; the font's own internal leading keeps a small gap above the glyphs.
@@ -492,14 +555,45 @@ func ensureBuffer() {
 	call(pSetWindowRgn, hMain, call(pCreateRoundRectRgn, 0, uintptr(-rad), uintptr(w+1), uintptr(h+1), uintptr(rad), uintptr(rad)), 1)
 }
 
+func drawLabel(s string, r rect, color uintptr) {
+	call(pSetTextColor, memDC, color)
+	call(pDrawTextW, memDC, uintptr(unsafe.Pointer(str(s))), ^uintptr(0), uintptr(unsafe.Pointer(&r)), dtCenter|dtVCenter|dtSingleLine|dtNoPrefix)
+	call(pSetTextColor, memDC, colorText)
+}
+
+func toastActive() bool { return toast != "" && time.Now().Before(toastUntil) }
+
+func showToast(msg string, color uintptr, d time.Duration) {
+	toast, toastColor, toastUntil = msg, color, time.Now().Add(d)
+	call(pSetTimer, hMain, toastTimer, uintptr(d.Milliseconds()+50), 0)
+}
+
+func drawFades() {
+	blend := uintptr(255<<16 | 1<<24) // SourceConstantAlpha 255, AC_SRC_ALPHA
+	call(pGdiAlphaBlend, memDC, 0, 0, uintptr(fadeW), uintptr(bufH), fadeDC[0], 0, 0, uintptr(fadeW), 1, blend)
+	call(pGdiAlphaBlend, memDC, uintptr(bufW-fadeW), 0, uintptr(fadeW), uintptr(bufH), fadeDC[1], 0, 0, uintptr(fadeW), 1, blend)
+}
+
 func draw() {
 	full := rect{0, 0, bufW, bufH}
 	call(pFillRect, memDC, uintptr(unsafe.Pointer(&full)), bgBrush)
+	if loading && !locked {
+		drawLabel("Loading...", full, colorDim)
+		return
+	}
+	if locked {
+		msg, color := "Password:  "+strings.Repeat("•", len(password)), uintptr(colorText)
+		if len(password) == 0 {
+			msg, color = "Enter password", colorDim
+		}
+		if toastActive() {
+			msg, color = toast, toastColor
+		}
+		drawLabel(msg, full, color)
+		return
+	}
 	if len(chunks) == 0 {
-		call(pSetTextColor, memDC, 0x808080)
-		call(pDrawTextW, memDC, uintptr(unsafe.Pointer(str(hintText))), ^uintptr(0), uintptr(unsafe.Pointer(&full)),
-			dtCenter|dtVCenter|dtSingleLine|dtNoPrefix)
-		call(pSetTextColor, memDC, 0xFFFFFF)
+		drawLabel(hintText, full, colorDim)
 	}
 	y := int32(0)
 	for i := range chunks {
@@ -514,15 +608,21 @@ func draw() {
 		}
 		call(pScriptStringOut, c.ssa, uintptr(x), uintptr(y), 0, 0, 0, 0, 0)
 	}
-	blend := uintptr(255<<16 | 1<<24) // SourceConstantAlpha 255, AC_SRC_ALPHA
-	call(pGdiAlphaBlend, memDC, 0, 0, uintptr(fadeW), uintptr(bufH), fadeDC[0], 0, 0, uintptr(fadeW), 1, blend)
-	call(pGdiAlphaBlend, memDC, uintptr(bufW-fadeW), 0, uintptr(fadeW), uintptr(bufH), fadeDC[1], 0, 0, uintptr(fadeW), 1, blend)
+	drawFades()
+	if toastActive() {
+		var size rect
+		call(pDrawTextW, memDC, uintptr(unsafe.Pointer(str(toast))), ^uintptr(0), uintptr(unsafe.Pointer(&size)), dtCalcRect|dtSingleLine|dtNoPrefix)
+		pill := rect{bufW - px(10) - (size.Right - size.Left) - px(20), 0, bufW - px(10), bufH}
+		call(pFillRect, memDC, uintptr(unsafe.Pointer(&pill)), toastBrush)
+		drawLabel(toast, pill, toastColor)
+	}
 }
 
 func present(hdc uintptr) {
 	ensureBuffer()
 	draw()
 	call(pBitBlt, hdc, 0, 0, uintptr(bufW), uintptr(bufH), memDC, 0, 0, srcCopy)
+	call(pGdiFlush) // submit now, so "Loading..." shows even while the thread is busy shaping
 }
 
 func render() {
@@ -559,13 +659,22 @@ func glideTo(p, w float64) {
 
 func glideBy(d, w float64) { glideTo(target+d, w) }
 
+// Spring stiffness for taps and the wheel follows the speed setting, so faster speeds also glide quicker.
+func tapOmega() float64 { return omegaSlow * math.Pow(float64(speed)/defaultSpeed, 0.4) }
+
+func changeSpeed(d int) {
+	speed = max(minSpeed, min(maxSpeed, speed+d))
+	showToast("Speed "+strconv.Itoa(speed), colorAccent, 1500*time.Millisecond)
+	call(pSetTimer, hMain, saveTimer, 500, 0)
+}
+
 // The glide starts the moment the arrow goes down; auto-repeat key-downs are ignored.
 func move(dir int, vk, lp uintptr) {
 	if lp&(1<<30) != 0 {
 		return
 	}
 	startAnim()
-	omega = omegaSlow
+	omega = tapOmega()
 	hold, holdVK = dir, vk
 	holdStart, holdOrigin = time.Now(), target
 }
@@ -613,7 +722,7 @@ func tick() {
 	lastTick = now
 	if hold != 0 {
 		if keyDown(holdVK) {
-			target = clampPos(target + float64(hold)*holdSpeedEms*float64(px(fontSize))*dt)
+			target = clampPos(target + float64(hold)*float64(speed)*float64(px(fontSize))*dt)
 		} else {
 			releaseHold()
 		}
@@ -629,20 +738,50 @@ func tick() {
 		stopAnim()
 	}
 	render()
+	// Wait for the next display refresh so every frame lands on a vsync (no 64Hz-vs-60Hz judder).
+	if animating && pDwmFlush.Find() == nil {
+		call(pDwmFlush)
+	}
 }
 
 func setText(s string) {
 	stopAnim()
-	text = normalize(s)
+	var truncated bool
+	text, truncated = limitText(normalize(s))
 	allSelected = false
-	buildChunks()
+	shape()
 	pos, target = 0, 0
 	render()
+	if truncated {
+		showToast("Too long: first part loaded", colorWarn, 4*time.Second)
+	}
 	call(pSetTimer, hMain, saveTimer, 500, 0)
 }
 
+// Shapes the script, showing "Loading..." first when that will take noticeable time.
+func shape() {
+	if len(text) > largeText {
+		loading = true
+		render()
+	}
+	buildChunks()
+	loading = false
+}
+
+// Another app may hold the clipboard for a moment, so retry briefly.
+func openClipboard() bool {
+	for range 10 {
+		if call(pOpenClipboard, hMain) != 0 {
+			return true
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	return false
+}
+
+// Reads at most the allocation size, so text from an app that forgot the terminating NUL is still safe.
 func clipboardText() (string, bool) {
-	if call(pOpenClipboard, hMain) == 0 {
+	if !openClipboard() {
 		return "", false
 	}
 	defer call(pCloseClipboard)
@@ -650,22 +789,23 @@ func clipboardText() (string, bool) {
 	if h == 0 {
 		return "", false
 	}
+	size := call(pGlobalSize, h) / 2 * 2
 	p := call(pGlobalLock, h)
 	if p == 0 {
 		return "", false
 	}
 	defer call(pGlobalUnlock, h)
-	n := call(pLstrlenW, p)
-	buf := make([]uint16, n+1)
-	if n > 0 {
-		call(pRtlMoveMemory, uintptr(unsafe.Pointer(&buf[0])), p, n*2)
+	if size == 0 {
+		return "", true
 	}
+	buf := make([]uint16, size/2)
+	call(pRtlMoveMemory, uintptr(unsafe.Pointer(&buf[0])), p, size)
 	return syscall.UTF16ToString(buf), true
 }
 
 func copyText() {
 	buf, err := syscall.UTF16FromString(strings.ReplaceAll(text, "\n", "\r\n"))
-	if err != nil || call(pOpenClipboard, hMain) == 0 {
+	if err != nil || !openClipboard() {
 		return
 	}
 	defer call(pCloseClipboard)
@@ -675,16 +815,86 @@ func copyText() {
 	if h == 0 {
 		return
 	}
-	call(pRtlMoveMemory, call(pGlobalLock, h), uintptr(unsafe.Pointer(&buf[0])), size)
+	p := call(pGlobalLock, h)
+	if p == 0 {
+		call(pGlobalFree, h)
+		return
+	}
+	call(pRtlMoveMemory, p, uintptr(unsafe.Pointer(&buf[0])), size)
 	call(pGlobalUnlock, h)
 	if call(pSetClipboardData, cfUnicodeText, h) == 0 {
 		call(pGlobalFree, h)
 	}
 }
 
+// An empty or whitespace-only clipboard is ignored so a stray Ctrl+V cannot wipe the script.
 func paste() {
-	if s, ok := clipboardText(); ok {
+	if s, ok := clipboardText(); ok && strings.TrimSpace(s) != "" {
 		setText(s)
+	}
+}
+
+func checkPassword(p string) bool {
+	salt, _ := hex.DecodeString(passwordSalt)
+	want, _ := hex.DecodeString(passwordKey)
+	got, err := pbkdf2.Key(sha256.New, p, salt, passwordRounds, len(want))
+	return err == nil && subtle.ConstantTimeCompare(got, want) == 1
+}
+
+// Proof of a past unlock, tied to this Windows user and computer so copying the file elsewhere does not unlock.
+func unlockToken() string {
+	sum := sha256.Sum256([]byte(passwordKey + "|" + os.Getenv("COMPUTERNAME") + "|" + os.Getenv("USERNAME")))
+	return hex.EncodeToString(sum[:])
+}
+
+func rememberedUnlock() bool {
+	b, err := os.ReadFile(dataPath("unlock"))
+	return err == nil && strings.TrimSpace(string(b)) == unlockToken()
+}
+
+func submitPassword() {
+	if checkPassword(string(password)) {
+		locked, password = false, nil
+		if p := dataPath("unlock"); p != "" {
+			os.WriteFile(p, []byte(unlockToken()), 0o644)
+		}
+	} else {
+		password = nil
+		showToast("Wrong password", colorError, 1500*time.Millisecond)
+	}
+	render()
+}
+
+func onPasswordChar(r rune) {
+	switch {
+	case r == '\r':
+		submitPassword()
+		return
+	case r == '\b':
+		if len(password) > 0 {
+			password = password[:len(password)-1]
+		}
+	case r < 0x20 || r == 0x7F:
+		return
+	case r > 0x7E:
+		showToast("Switch keyboard to English", colorWarn, 1500*time.Millisecond)
+		render()
+		return
+	case len(password) < maxPassword:
+		password = append(password, r)
+	}
+	toastUntil = time.Time{}
+	render()
+}
+
+func pastePassword() {
+	if s, ok := clipboardText(); ok {
+		line, _, _ := strings.Cut(strings.TrimSpace(normalize(s)), "\n")
+		if r := []rune(strings.TrimSpace(line)); len(r) > 0 {
+			password = r[:min(len(r), maxPassword)]
+			toastUntil = time.Time{}
+			render()
+		}
 	}
 }
 
@@ -701,9 +911,19 @@ func onKey(vk, lp uintptr) {
 	if vk == vkShift || vk == vkControl || vk == vkMenu {
 		return
 	}
+	ctrl := keyDown(vkControl) && !keyDown(vkMenu)
+	if locked {
+		switch {
+		case vk == vkEscape:
+			call(pPostMessageW, hMain, wmClose, 0, 0)
+		case ctrl && vk == 'V', vk == vkInsert && keyDown(vkShift):
+			pastePassword()
+		}
+		return
+	}
 	wasSelected := allSelected
 	allSelected = false
-	if keyDown(vkControl) && !keyDown(vkMenu) {
+	if ctrl {
 		switch vk {
 		case 'V':
 			paste()
@@ -746,6 +966,10 @@ func onKey(vk, lp uintptr) {
 		glideTo(maxPos(), omegaFast)
 	case vkHome:
 		glideTo(0, omegaFast)
+	case vkOemPlus, vkAdd:
+		changeSpeed(1)
+	case vkOemMinus, vkSubtract:
+		changeSpeed(-1)
 	case vkDelete, vkBack:
 		if wasSelected {
 			setText("")
@@ -778,7 +1002,7 @@ func saveText() {
 
 func saveSettings() {
 	r := windowRect()
-	b, _ := json.Marshal(config{configVersion, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, fontSize, pos})
+	b, _ := json.Marshal(config{V: configVersion, X: r.Left, Y: r.Top, W: r.Right - r.Left, H: r.Bottom - r.Top, Font: fontSize, Pos: pos, Speed: speed})
 	if p := dataPath("settings.json"); p != "" {
 		os.WriteFile(p, b, 0o644)
 	}
@@ -818,6 +1042,11 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 	case wmKeyDown:
 		onKey(wp, lp)
 		return 0
+	case wmChar:
+		if locked {
+			onPasswordChar(rune(wp))
+		}
+		return 0
 	case wmKeyUp:
 		if hold != 0 && wp == holdVK {
 			releaseHold()
@@ -826,6 +1055,9 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 	case wmKillFocus:
 		releaseHold()
 	case wmMouseWheel:
+		if locked {
+			return 0
+		}
 		delta := float64(int16(wp >> 16))
 		if wp&mkControl != 0 {
 			if delta > 0 {
@@ -835,7 +1067,7 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 			}
 			render()
 		} else {
-			glideBy(-delta/120*step()/2, omegaSlow)
+			glideBy(-delta/120*step()/2, tapOmega())
 		}
 		return 0
 	case wmLButtonDown, wmRButtonDown:
@@ -875,6 +1107,16 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 		case saveTimer:
 			call(pKillTimer, hwnd, saveTimer)
 			saveText()
+			saveSettings()
+		case toastTimer:
+			call(pKillTimer, hwnd, toastTimer)
+			render()
+		}
+		return 0
+	case wmEndSession:
+		if wp != 0 {
+			saveText()
+			saveSettings()
 		}
 		return 0
 	case wmClose:
@@ -890,6 +1132,14 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 }
 
 func main() {
+	// One bar at a time: a second launch just brings the running one to the front.
+	if _, _, err := pCreateMutexW.Call(0, 0, uintptr(unsafe.Pointer(str(`Local\SG.Teleprompter`)))); err == syscall.Errno(errAlreadyExists) {
+		if w := call(pFindWindowW, uintptr(unsafe.Pointer(str("TeleprompterBar"))), 0); w != 0 {
+			call(pShowWindow, w, 5)
+			call(pSetForegroundWindow, w)
+		}
+		return
+	}
 	if pSetProcessDPIAware.Find() == nil {
 		call(pSetProcessDPIAware)
 	}
@@ -902,6 +1152,7 @@ func main() {
 	hInst := call(pGetModuleHandleW, 0)
 	bgBrush = call(pCreateSolidBrush, 0)
 	selBrush = call(pCreateSolidBrush, 0x00B4641E)
+	toastBrush = call(pCreateSolidBrush, 0x00302820)
 	cls := str("TeleprompterBar")
 	wc := wndClassExW{
 		cbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
@@ -924,7 +1175,11 @@ func main() {
 		if cfg.V == configVersion {
 			x, w = cfg.X, cfg.W
 		}
+		if cfg.Speed >= minSpeed && cfg.Speed <= maxSpeed {
+			speed = cfg.Speed
+		}
 	}
+	locked = !rememberedUnlock()
 
 	hMain = call(pCreateWindowExW, wsExLayered|wsExTopmost, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(str("Teleprompter"))),
 		wsPopup, uintptr(x), uintptr(y), uintptr(w), uintptr(h), 0, 0, hInst, 0)
@@ -941,19 +1196,21 @@ func main() {
 	if !saved {
 		s = helpText
 	}
-	text = normalize(s)
-	applyFont(fontSize)
-	if haveCfg {
-		pos = clampPos(cfg.Pos)
-		target = pos
-	}
+	text, _ = limitText(normalize(s))
+	setFont(fontSize)
 
+	// Show the bar before shaping so a long saved script displays "Loading..." instead of nothing.
 	call(pShowWindow, hMain, 5)
 	if pSetWindowDisplayAffinity.Find() == nil {
 		call(pSetWindowDisplayAffinity, hMain, wdaExcludeFromCapture)
 	}
 	call(pSetForegroundWindow, hMain)
 	call(pSetFocus, hMain)
+	shape()
+	if haveCfg {
+		pos = clampPos(cfg.Pos)
+		target = pos
+	}
 	render()
 
 	var m msgT
