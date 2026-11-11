@@ -87,12 +87,11 @@ const (
 	swpNoZOrder   = 0x0004
 	swpNoActivate = 0x0010
 
-	lwaAlpha              = 0x2
-	wdaExcludeFromCapture = 0x11
-	animTimer             = 1
-	saveTimer             = 2
-	toastTimer            = 3
-	opacity               = 217
+	lwaAlpha   = 0x2
+	animTimer  = 1
+	saveTimer  = 2
+	toastTimer = 3
+	opacity    = 217
 
 	omegaSlow     = 7.0  // taps, held arrows, wheel: a calm ~0.8s glide at the default speed
 	omegaFast     = 22.0 // sentence and page jumps
@@ -220,7 +219,6 @@ var (
 	pPostMessageW               = user32.NewProc("PostMessageW")
 	pDestroyWindow              = user32.NewProc("DestroyWindow")
 	pSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
-	pSetWindowDisplayAffinity   = user32.NewProc("SetWindowDisplayAffinity")
 	pSetProcessDPIAware         = user32.NewProc("SetProcessDPIAware")
 	pGetSystemMetrics           = user32.NewProc("GetSystemMetrics")
 	pSetWindowPos               = user32.NewProc("SetWindowPos")
@@ -1189,9 +1187,6 @@ func main() {
 
 	// Show the bar before shaping so a long saved script displays "Loading..." instead of nothing.
 	call(pShowWindow, hMain, 5)
-	if pSetWindowDisplayAffinity.Find() == nil {
-		call(pSetWindowDisplayAffinity, hMain, wdaExcludeFromCapture)
-	}
 	call(pSetForegroundWindow, hMain)
 	call(pSetFocus, hMain)
 	shape()

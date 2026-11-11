@@ -6,7 +6,7 @@
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
     $name = 'Teleprompter'
-    $version = '1.2.0'
+    $version = '1.3.0'
     $url = 'https://raw.githubusercontent.com/sadrax4/flow/main/Teleprompter.exe'
     $dir = Join-Path $env:LOCALAPPDATA "Programs\$name"
     $exe = Join-Path $dir "$name.exe"
