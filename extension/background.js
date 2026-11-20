@@ -21,6 +21,11 @@ async function callApp(path, init = {}) {
     },
   });
   if (res.status === 204) return null;
+  if (res.status === 409) {
+    // Teleprompter carries a different copy of this extension and has just written it to disk: load it.
+    chrome.runtime.reload();
+    return null;
+  }
   if (!res.ok) throw new Error(`Teleprompter replied ${res.status}`);
   return res.json();
 }
@@ -90,6 +95,14 @@ chrome.runtime.onConnect.addListener(port => {
     if (Date.now() - at < 60000) dispatch(shot);
   }
   serve(port, stop.signal);
+});
+
+// After an install or an update, start in the ChatGPT tabs that are already open, so they need no refresh.
+chrome.runtime.onInstalled.addListener(async () => {
+  const tabs = await chrome.tabs.query({ url: ['https://chatgpt.com/*', 'https://chat.openai.com/*'] }).catch(() => []);
+  for (const tab of tabs) {
+    chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }).catch(() => {});
+  }
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {

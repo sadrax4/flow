@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Teleprompter for ChatGPT",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Sends Win+Shift+S screenshots from Teleprompter to ChatGPT and streams the answer back to the bar.",
-  "host_permissions": ["http://127.0.0.1:38457/*"],
+  "permissions": ["scripting"],
+  "host_permissions": ["http://127.0.0.1:38457/*", "https://chatgpt.com/*", "https://chat.openai.com/*"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
     {

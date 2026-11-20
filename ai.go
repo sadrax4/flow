@@ -76,6 +76,8 @@ var (
 	aiAnswer aiReply
 	aiErr    string
 
+	aiReloadAsked sync.Map // extension versions already asked to reload themselves in this run
+
 	aiLogMu        sync.Mutex
 	aiLogStarted   atomic.Int64 // newest snip whose arriving answer was logged
 	aiRefusedLogAt atomic.Int64 // unix nanos of the last logged refusal, so a busy website can't flood the log
@@ -304,8 +306,18 @@ func aiWaitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The polling tab's extension is the one that will handle the next snip.
-	if ver := r.Header.Get("X-TP-Ext"); aiExtSeen.Swap(ver) != ver {
+	ver := r.Header.Get("X-TP-Ext")
+	if aiExtSeen.Swap(ver) != ver {
 		aiLog("Chrome is running extension %s; this app needs %s", aiExtLabel(ver), aiExtWant)
+	}
+	// From 1.3.0 the extension reloads itself on a 409, picking up the copy aiStart wrote. Asked once per version,
+	// so an extension loaded from some other folder can't loop; versions before 1.3.0 just retry.
+	if ver != aiExtWant && ver != "" {
+		if _, asked := aiReloadAsked.LoadOrStore(ver, true); !asked {
+			aiLog("asking Chrome to load extension %s from disk in place of %s", aiExtWant, ver)
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
 	}
 	timeout := time.NewTimer(20 * time.Second)
 	defer timeout.Stop()
