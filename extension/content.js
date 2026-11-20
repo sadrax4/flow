@@ -118,16 +118,32 @@
     ].join('\n');
   }
 
-  // Changes once an image is attached: the composer's upload flag, its ready-attachments field, or a preview image.
-  function attachmentState() {
+  // The composer's hidden attachment fields: fileAttachments and pendingFileUploads when logged in,
+  // imageAttachments and pendingImageUploads when logged out.
+  const attachmentFields = box => [...box.querySelectorAll('input[type="hidden"]')].filter(i => /attachment|upload/i.test(i.name));
+  const filled = v => !!v && v !== '[]' && v !== '{}';
+  const pendingFlags = box => [...box.attributes].filter(a => /upload-pending/.test(a.name)).map(a => a.name);
+
+  // Changes as soon as an image is pasted: an upload flag, an attachment field, or a preview image.
+  function attachmentState(forLog = false) {
     const box = composer();
-    if (!box) return '';
+    if (!box) return 'no composer';
     return [
-      box.hasAttribute('data-octane-native-image-upload-pending'),
-      box.elements?.namedItem('imageAttachments')?.value ?? '',
-      box.querySelectorAll('img').length,
-    ].join('|');
+      ...attachmentFields(box).map(i => `${i.name}=${forLog ? i.value.length : i.value}`),
+      ...pendingFlags(box),
+      `img=${box.querySelectorAll('img').length}`,
+      `blob-img=${document.querySelectorAll('img[src^="blob:"]').length}`,
+    ].join(' ');
   }
+
+  // Still uploading: ChatGPT ignores a send until every pending upload is done.
+  function uploading(box) {
+    return pendingFlags(box).length > 0 || attachmentFields(box).some(i => /^pending/i.test(i.name) && filled(i.value));
+  }
+  const attachedAndUploaded = box =>
+    !uploading(box) && attachmentFields(box).some(i => /attachments$/i.test(i.name) && filled(i.value));
+
+  const userMessages = () => findAll('[data-message-role="user"], [data-message-author-role="user"]');
 
   async function waitFor(check, ms, failure) {
     const end = Date.now() + ms;
@@ -176,7 +192,7 @@
   }
 
   function answerText(msg) {
-    return (msg.querySelector('.markdown') || msg).innerText.trim();
+    return (msg.querySelector('[data-assistant-markdown], .markdown') || msg).innerText.trim();
   }
 
   function stepper(id) {
@@ -192,38 +208,65 @@
     const bytes = Uint8Array.from(atob(shot.png), c => c.charCodeAt(0));
     const file = new File([bytes], `screenshot-${shot.id}.png`, { type: 'image/png' });
 
-    // Paste like a user would; if nothing gets attached, use the attach button's file input instead.
+    // Paste like a user would. The file input is only a fallback for when the page shows no sign of the paste at all,
+    // since attaching both ways would add the image twice.
     const before = attachmentState();
+    step(`attachments before: ${attachmentState(true)}`);
     pasteFile(file);
     try {
-      await waitFor(() => attachmentState() !== before, 5000, '');
-      step(`image pasted (attachments ${before} -> ${attachmentState()})`);
+      await waitFor(() => attachmentState() !== before, 8000, '');
+      step(`image pasted (${attachmentState(true)})`);
     } catch {
       const input = fileInput();
-      step(`pasting attached nothing (attachments ${before}); trying file input ${describe(input)}`);
+      step(`no sign of the pasted image after 8s; trying file input ${describe(input)}`);
       if (input) chooseFile(input, file);
-      await waitFor(() => attachmentState() !== before, 5000, 'could not attach image');
-      step(`image attached through the file input (attachments ${attachmentState()})`);
+      await waitFor(() => attachmentState() !== before, 8000, 'could not attach image');
+      step(`image attached through the file input (${attachmentState(true)})`);
+    }
+    const box2 = composer();
+    if (box2 && attachmentFields(box2).length) {
+      await waitFor(() => composer() && attachedAndUploaded(composer()), 2 * 60 * 1000, 'image upload did not finish');
+      step(`upload finished (${attachmentState(true)})`);
     }
     if (shot.prompt) {
       typeAtEnd(shot.prompt);
       step(`prompt typed, the box now holds ${boxLength(editor())} characters`);
     }
-    // The send button stays disabled until the upload finishes; with no recognisable button, press Enter.
-    const button = await waitFor(sendButton, 60000, '').catch(() => null);
+    const usersBefore = userMessages().length;
     // Sending may load a new page; the copy of this script there picks the answer up from this note.
     sessionStorage.setItem(PENDING, JSON.stringify({ id: shot.id, at: Date.now() }));
-    if (button) {
-      step(`clicking send ${describe(button)}`);
-      button.click();
-    } else {
-      step(`send button not ready after 60s (${describe(anySendButton())}); pressing Enter`);
-      editor().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-    }
+    await submit(step, usersBefore);
     // In a background tab ChatGPT may only show the answer once it is complete, and thinking can take minutes.
     await waitFor(() => assistantMessages().length > answersBefore, 4 * 60 * 1000, 'no answer');
     step('answer started');
     await streamAnswer(shot.id, step);
+  }
+
+  // Accepted once ChatGPT empties the box, shows the question, or starts answering.
+  const accepted = usersBefore => userMessages().length > usersBefore || generating() || boxLength(editor()) === 0;
+
+  // Click send; if ChatGPT doesn't take it, press Enter, then submit the form, checking after each try.
+  async function submit(step, usersBefore) {
+    const button = await waitFor(sendButton, 60000, '').catch(() => null);
+    const tries = [
+      [`clicking send ${describe(button ?? anySendButton())}`, () => (button ?? anySendButton())?.click()],
+      ['pressing Enter', () => editor()?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }))],
+      ['submitting the form', () => {
+        const form = editor()?.form;
+        form?.requestSubmit(form.querySelector(SEND) ?? undefined);
+      }],
+    ];
+    for (const [what, act] of tries) {
+      step(what);
+      act();
+      try {
+        await waitFor(() => accepted(usersBefore), 6000, '');
+        step('sent');
+        return;
+      } catch {}
+      if (!composer()) return; // the page is moving to the new chat; the copy there follows the answer
+    }
+    throw new Error('could not send');
   }
 
   async function streamAnswer(id, step) {
