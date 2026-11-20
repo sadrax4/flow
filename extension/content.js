@@ -145,6 +145,16 @@
 
   const userMessages = () => findAll('[data-message-role="user"], [data-message-author-role="user"]');
 
+  // Long chats keep only part of the history on the page, so the answer is found as an assistant message that
+  // wasn't there before the question was sent (by its id, which a redrawn old message keeps), not by counting.
+  // Only messages below the newest question count, in case old answers get redrawn.
+  const messageKey = el => el.id || el;
+  function freshAnswers(known) {
+    const question = userMessages().at(-1);
+    return assistantMessages().filter(m => !known.has(messageKey(m))
+      && (!question || question.compareDocumentPosition(m) & Node.DOCUMENT_POSITION_FOLLOWING));
+  }
+
   async function waitFor(check, ms, failure) {
     const end = Date.now() + ms;
     for (;;) {
@@ -191,8 +201,10 @@
     document.execCommand('insertText', false, text);
   }
 
+  // The message's last markdown block: the answer itself, without button labels or a thinking summary above it.
   function answerText(msg) {
-    return (msg.querySelector('[data-assistant-markdown], .markdown') || msg).innerText.trim();
+    const blocks = msg.querySelectorAll('[data-assistant-markdown], .markdown');
+    return (blocks.length ? blocks[blocks.length - 1] : msg).innerText.trim();
   }
 
   function stepper(id) {
@@ -204,7 +216,7 @@
     step(`reached the ChatGPT tab ${where()}`);
     const box = await waitFor(editor, 15000, 'chat box not found');
     step(`chat box ${describe(box)} in ${describe(composer())}`);
-    const answersBefore = assistantMessages().length;
+    const known = new Set(assistantMessages().map(messageKey));
     const bytes = Uint8Array.from(atob(shot.png), c => c.charCodeAt(0));
     const file = new File([bytes], `screenshot-${shot.id}.png`, { type: 'image/png' });
 
@@ -237,9 +249,17 @@
     sessionStorage.setItem(PENDING, JSON.stringify({ id: shot.id, at: Date.now() }));
     await submit(step, usersBefore);
     // In a background tab ChatGPT may only show the answer once it is complete, and thinking can take minutes.
-    await waitFor(() => assistantMessages().length > answersBefore, 4 * 60 * 1000, 'no answer');
-    step('answer started');
-    await streamAnswer(shot.id, step);
+    const sentAt = Date.now();
+    let described = false;
+    await waitFor(() => {
+      if (!described && Date.now() - sentAt > 20000) {
+        described = true;
+        step(`no new answer on the page after 20s; the page now:\n${describePage()}`);
+      }
+      return freshAnswers(known).length > 0;
+    }, 4 * 60 * 1000, 'no answer');
+    step(`answer started in ${describe(freshAnswers(known).at(-1))}`);
+    await streamAnswer(shot.id, step, known);
   }
 
   // Accepted once ChatGPT empties the box, shows the question, or starts answering.
@@ -269,14 +289,14 @@
     throw new Error('could not send');
   }
 
-  async function streamAnswer(id, step) {
+  async function streamAnswer(id, step, known = new Set()) {
     let text = '', sent = '', changedAt = Date.now(), sentAt = 0;
     const deadline = Date.now() + 5 * 60 * 1000;
     try {
       for (;;) {
         await sleep(200);
-        const all = assistantMessages();
-        const now = all.length ? answerText(all[all.length - 1]) : '';
+        const fresh = freshAnswers(known);
+        const now = fresh.length ? answerText(fresh[fresh.length - 1]) : '';
         if (now !== text) {
           text = now;
           changedAt = Date.now();
@@ -289,7 +309,7 @@
         const finished = !generating() && text && Date.now() - changedAt > 1200;
         if (finished || Date.now() > deadline) break;
       }
-      step(Date.now() > deadline ? 'stopped following the answer after 5 minutes' : 'answer finished');
+      step(Date.now() > deadline ? 'stopped following the answer after 5 minutes' : `answer finished, ${text.length} characters`);
       report({ id, text, done: true });
     } finally {
       sessionStorage.removeItem(PENDING);
