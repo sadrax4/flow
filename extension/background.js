@@ -3,7 +3,8 @@
 let config;
 let queue = Promise.resolve(); // answers and log lines, sent to the app in order
 const waiting = new Set(); // ports of ChatGPT tabs waiting for a snip
-let spare = null; // a snip whose tab closed as it arrived, kept briefly for the next tab
+let spare = null; // a snip waiting for a tab: its tab closed as it arrived, or the selected tab is busy
+let heldNoted = 0; // last snip logged as waiting, so it's noted once
 
 async function getConfig() {
   config ??= await (await fetch(chrome.runtime.getURL('config.json'))).json();
@@ -34,7 +35,10 @@ function post(path, body) {
   queue = queue.then(() => callApp(path, { method: 'POST', body: JSON.stringify(body) })).catch(() => {});
 }
 
-// With several ChatGPT tabs open, the snip goes to the selected tab of the last focused window.
+const CHATGPT = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
+
+// With several ChatGPT tabs open, the snip goes to the selected tab of the last focused window. A snip is never
+// asked in a background tab while a selected ChatGPT tab is busy with the previous one: it waits for that tab.
 async function pickPort() {
   const focused = await chrome.windows.getLastFocused().catch(() => null);
   let best = null;
@@ -47,14 +51,22 @@ async function pickPort() {
       bestScore = score;
     }
   }
+  if (best && bestScore < 2) {
+    const selected = await chrome.tabs.query({ active: true, url: CHATGPT }).catch(() => []);
+    if (selected.length) return null;
+  }
   return best;
 }
 
-async function dispatch(shot) {
+async function dispatch(shot, at = Date.now()) {
   for (;;) {
     const port = await pickPort();
     if (!port) {
-      spare = { shot, at: Date.now() };
+      if (waiting.size && heldNoted !== shot.id) {
+        heldNoted = shot.id;
+        post('/log', { line: `snip #${shot.id} waits for the selected ChatGPT tab, which is still busy` });
+      }
+      spare = { shot, at };
       return;
     }
     waiting.delete(port);
@@ -92,14 +104,14 @@ chrome.runtime.onConnect.addListener(port => {
   if (spare) {
     const { shot, at } = spare;
     spare = null;
-    if (Date.now() - at < 60000) dispatch(shot);
+    if (Date.now() - at < 2 * 60 * 1000) dispatch(shot, at);
   }
   serve(port, stop.signal);
 });
 
 // After an install or an update, start in the ChatGPT tabs that are already open, so they need no refresh.
 chrome.runtime.onInstalled.addListener(async () => {
-  const tabs = await chrome.tabs.query({ url: ['https://chatgpt.com/*', 'https://chat.openai.com/*'] }).catch(() => []);
+  const tabs = await chrome.tabs.query({ url: CHATGPT }).catch(() => []);
   for (const tab of tabs) {
     chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }).catch(() => {});
   }

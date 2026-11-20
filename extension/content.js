@@ -256,10 +256,28 @@
     document.execCommand('insertText', false, text);
   }
 
-  // The message's last markdown block: the answer itself, without button labels or a thinking summary above it.
+  // An answer's text block. The role marker is either the whole message (web composer) or only its
+  // "ChatGPT said:" heading (the logged-in app); then the answer is the last response block after the heading,
+  // before the next message. Button labels and anything outside those blocks stay out.
+  const BODY = '[data-response-body], [data-assistant-markdown], .markdown';
+  function answerBody(msg) {
+    const inside = msg.querySelectorAll(BODY);
+    if (inside.length) return inside[inside.length - 1];
+    let after = false, body = null;
+    for (const el of findAll(`${MESSAGE}, ${BODY}`)) {
+      if (el === msg) {
+        after = true;
+      } else if (after) {
+        if (el.matches(MESSAGE) && !msg.contains(el)) break;
+        if (el.matches(BODY) && !body?.contains(el)) body = el;
+      }
+    }
+    return body;
+  }
   function answerText(msg) {
-    const blocks = msg.querySelectorAll('[data-response-body], [data-assistant-markdown], .markdown');
-    return (blocks.length ? blocks[blocks.length - 1] : msg).innerText.trim();
+    const body = answerBody(msg);
+    if (body) return body.innerText.trim();
+    return /^H[1-6]$/.test(msg.tagName) ? '' : msg.innerText.trim();
   }
 
   function stepper(id) {
@@ -342,13 +360,18 @@
   }
 
   async function streamAnswer(id, step, ctx = { known: new Set() }) {
-    let text = '', sent = '', changedAt = Date.now(), sentAt = 0, sawBusy = false;
+    let text = '', sent = '', changedAt = Date.now(), sentAt = 0, sawBusy = false, described = false;
+    const startedAt = Date.now();
     const deadline = Date.now() + 5 * 60 * 1000;
     try {
       for (;;) {
         await sleep(200);
         const answer = ourAnswer(ctx);
         const now = answer ? answerText(answer) : '';
+        if (!now && !described && Date.now() - startedAt > 20000) {
+          described = true;
+          step(`the answer has no readable text after 20s; the page now:\n${describePage()}`);
+        }
         if (now !== text) {
           text = now;
           changedAt = Date.now();
