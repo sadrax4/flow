@@ -62,7 +62,8 @@
 
   // Known composer markers first; otherwise the visible text box lowest on the page.
   function editor() {
-    const known = findAll('[data-mobile-composer-prompt], #prompt-textarea, textarea[name="prompt"]').find(visible);
+    const known = findAll('[data-mobile-composer-prompt], #prompt-textarea, textarea[name="prompt"], ' +
+      '[contenteditable="true"][data-composer-markdown]').find(visible);
     if (known) return known;
     return findAll('textarea, [contenteditable="true"], [role="textbox"]')
       .filter(el => visible(el) && el.getBoundingClientRect().width > 200)
@@ -80,7 +81,13 @@
     return ed.parentElement;
   }
 
-  const assistantMessages = () => findAll('[data-message-role="assistant"], [data-message-author-role="assistant"]');
+  // Chat messages and their role: data-message-role (web composer), data-message-author-role (older page),
+  // data-conversation-role (the logged-in app).
+  const MESSAGE = '[data-message-role], [data-message-author-role], [data-conversation-role]';
+  const roleOf = el => (el.getAttribute('data-message-role') ?? el.getAttribute('data-message-author-role')
+    ?? el.getAttribute('data-conversation-role') ?? '').toLowerCase();
+  const assistantMessages = () => findAll(MESSAGE).filter(el => roleOf(el) !== 'user');
+  const userMessages = () => findAll(MESSAGE).filter(el => roleOf(el) === 'user');
   const generating = () => findAll(
     '[data-message-role="assistant"][data-message-streaming]:not([data-message-complete]), ' +
     'button[data-composer-submit][data-stop-generating], [data-testid="stop-button"], button[aria-label^="Stop" i]').length > 0;
@@ -114,45 +121,102 @@
       'composer: ' + describe(composer()),
       'composer buttons: ' + [...(composer()?.querySelectorAll('button') ?? [])].slice(0, 15).map(describe).join(' | '),
       'notices on screen: ' + (notices.join(' | ') || 'none'),
+      'newest messages: ' + (findAll(MESSAGE).slice(-4).map(m => `${describe(m)} containing ` +
+        [...m.querySelectorAll('*')].filter(el => [...el.attributes].some(a => a.name.startsWith('data-'))).slice(0, 8).map(describe).join(' ')
+      ).join(' || ') || 'none'),
+      'composer area: ' + describeComposer(),
       'data attributes: ' + Object.entries(names).sort((a, b) => b[1] - a[1]).slice(0, 120).map(([n, c]) => `${n}:${c}`).join(' '),
     ].join('\n');
   }
 
-  // The composer's hidden attachment fields: fileAttachments and pendingFileUploads when logged in,
-  // imageAttachments and pendingImageUploads when logged out.
-  const attachmentFields = box => [...box.querySelectorAll('input[type="hidden"]')].filter(i => /attachment|upload/i.test(i.name));
-  const filled = v => !!v && v !== '[]' && v !== '{}';
-  const pendingFlags = box => [...box.attributes].filter(a => /upload-pending/.test(a.name)).map(a => a.name);
+  // The whole composer area: the box's highest ancestor that is still a small part of the window,
+  // so it takes in the row of attachment previews but not the conversation.
+  function composerArea() {
+    const ed = editor();
+    if (!ed) return null;
+    let area = ed;
+    for (let el = ed.parentElement; el && el !== document.body; el = el.parentElement) {
+      if (el.getBoundingClientRect().height > innerHeight * 0.45) break;
+      area = el;
+    }
+    return area;
+  }
 
-  // Changes as soon as an image is pasted: an upload flag, an attachment field, or a preview image.
+  // Hidden attachment fields (logged-in web composer: fileAttachments, pendingFileUploads; logged out:
+  // imageAttachments, pendingImageUploads) and upload flags such as data-octane-auth-file-upload-pending.
+  const attachmentFields = area => [...area.querySelectorAll('input[type="hidden"]')].filter(i => /attachment|upload/i.test(i.name));
+  const filled = v => !!v && v !== '[]' && v !== '{}';
+  const pendingFlags = area => [area, ...area.querySelectorAll('*')]
+    .flatMap(el => [...el.attributes].filter(a => /upload-pending/.test(a.name)).map(a => a.name));
+
+  // Changes as soon as an image is pasted: attachment fields or flags, the composer's layout (the app switches
+  // to a stacked layout with a row of previews), or the number of elements and pictures in the composer.
   function attachmentState(forLog = false) {
-    const box = composer();
-    if (!box) return 'no composer';
+    const area = composerArea();
+    if (!area) return 'no composer';
+    const layout = [];
+    for (let el = editor(); el && el !== area.parentElement; el = el.parentElement) {
+      for (const a of el.attributes) if (/layout|rows|attach|upload/i.test(a.name)) layout.push(`${a.name}=${a.value}`);
+    }
     return [
-      ...attachmentFields(box).map(i => `${i.name}=${forLog ? i.value.length : i.value}`),
-      ...pendingFlags(box),
-      `img=${box.querySelectorAll('img').length}`,
-      `blob-img=${document.querySelectorAll('img[src^="blob:"]').length}`,
+      ...attachmentFields(area).map(i => `${i.name}=${forLog ? i.value.length : i.value}`),
+      ...pendingFlags(area),
+      ...layout,
+      `elements=${area.querySelectorAll('*').length}`,
+      `pictures=${area.querySelectorAll('img, canvas, video, [style*="background-image"]').length}`,
     ].join(' ');
   }
 
   // Still uploading: ChatGPT ignores a send until every pending upload is done.
-  function uploading(box) {
-    return pendingFlags(box).length > 0 || attachmentFields(box).some(i => /^pending/i.test(i.name) && filled(i.value));
+  function uploading(area) {
+    return pendingFlags(area).length > 0 || attachmentFields(area).some(i => /^pending/i.test(i.name) && filled(i.value));
   }
-  const attachedAndUploaded = box =>
-    !uploading(box) && attachmentFields(box).some(i => /attachments$/i.test(i.name) && filled(i.value));
+  const attachedAndUploaded = area =>
+    !uploading(area) && attachmentFields(area).some(i => /attachments$/i.test(i.name) && filled(i.value));
 
-  const userMessages = () => findAll('[data-message-role="user"], [data-message-author-role="user"]');
+  // Waits until a value stops changing for `quietMs` (an upload's progress shows as changes in the composer).
+  async function settle(read, quietMs, maxMs) {
+    const end = Date.now() + maxMs;
+    let last = read(), since = Date.now();
+    while (Date.now() < end && Date.now() - since < quietMs) {
+      await sleep(150);
+      const now = read();
+      if (now !== last) {
+        last = now;
+        since = Date.now();
+      }
+    }
+  }
+
+  // The composer's elements with their attributes (no text), for the log when the paste isn't seen.
+  const describeComposer = () => [...(composerArea()?.querySelectorAll('*') ?? [])]
+    .filter(el => el.attributes.length).slice(0, 40).map(describe).join(' | ');
 
   // Long chats keep only part of the history on the page, so the answer is found as an assistant message that
   // wasn't there before the question was sent (by its id, which a redrawn old message keeps), not by counting.
   // Only messages below the newest question count, in case old answers get redrawn.
-  const messageKey = el => el.id || el;
-  function freshAnswers(known) {
-    const question = userMessages().at(-1);
-    return assistantMessages().filter(m => !known.has(messageKey(m))
-      && (!question || question.compareDocumentPosition(m) & Node.DOCUMENT_POSITION_FOLLOWING));
+  const messageKey = el => el.id || el.getAttribute('data-turn-key') || el.getAttribute('data-dil-message-id')
+    || el.getAttribute('data-message-id') || el.closest('[data-turn-key]')?.getAttribute('data-turn-key') || el;
+  const keysOf = list => new Set(list.map(messageKey));
+  const fresh = (list, known) => list.filter(m => !known.has(messageKey(m)));
+  // Once the question just sent is on the page, any answer below it is ours; until then (or after a page change)
+  // an answer counts only if it is new and below the newest question.
+  function freshAnswers(known, questionsBefore) {
+    const ours = questionsBefore ? fresh(userMessages(), questionsBefore).at(-1) : undefined;
+    const question = ours ?? userMessages().at(-1);
+    return assistantMessages().filter(m => (!question || question.compareDocumentPosition(m) & Node.DOCUMENT_POSITION_FOLLOWING)
+      && (ours || !known.has(messageKey(m))));
+  }
+
+  // The answer to the question just sent: a new message below it. If none shows up for 15s (a page that reuses
+  // message ids), the last answer on the page once its text differs from the last answer before sending.
+  function ourAnswer(ctx) {
+    const answers = freshAnswers(ctx.known, ctx.questionsBefore);
+    if (answers.length) return answers.at(-1);
+    if (!ctx.sentAt || Date.now() - ctx.sentAt < 15000) return null;
+    const last = assistantMessages().at(-1);
+    const text = last ? answerText(last) : '';
+    return text && text !== ctx.lastBefore ? last : null;
   }
 
   async function waitFor(check, ms, failure) {
@@ -172,17 +236,8 @@
     editor().dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
   }
 
-  const fileInput = () => findAll('#octane-mobile-composer-files-input, input[type="file"][data-octane-native-image-picker-source="files"]')[0]
-    || composer()?.querySelector('input[type="file"]') || findAll('input[type="file"]')[0] || null;
-
-  function chooseFile(input, file) {
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    input.files = dt.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-
-  const boxLength = el => (!el ? '?' : (el instanceof HTMLTextAreaElement ? el.value : el.innerText).length);
+  // An emptied rich-text box still holds a line break, so whitespace doesn't count.
+  const boxLength = el => (!el ? '?' : (el instanceof HTMLTextAreaElement ? el.value : el.innerText).trim().length);
 
   function typeAtEnd(text) {
     const el = editor();
@@ -203,7 +258,7 @@
 
   // The message's last markdown block: the answer itself, without button labels or a thinking summary above it.
   function answerText(msg) {
-    const blocks = msg.querySelectorAll('[data-assistant-markdown], .markdown');
+    const blocks = msg.querySelectorAll('[data-response-body], [data-assistant-markdown], .markdown');
     return (blocks.length ? blocks[blocks.length - 1] : msg).innerText.trim();
   }
 
@@ -216,57 +271,54 @@
     step(`reached the ChatGPT tab ${where()}`);
     const box = await waitFor(editor, 15000, 'chat box not found');
     step(`chat box ${describe(box)} in ${describe(composer())}`);
-    const known = new Set(assistantMessages().map(messageKey));
+    const ctx = { known: keysOf(assistantMessages()), lastBefore: answerText(assistantMessages().at(-1) ?? document.createElement('i')) };
     const bytes = Uint8Array.from(atob(shot.png), c => c.charCodeAt(0));
     const file = new File([bytes], `screenshot-${shot.id}.png`, { type: 'image/png' });
 
-    // Paste like a user would. The file input is only a fallback for when the page shows no sign of the paste at all,
-    // since attaching both ways would add the image twice.
+    // Paste like a user would, once: ChatGPT takes pasted images, and attaching another way as well added it twice.
     const before = attachmentState();
-    step(`attachments before: ${attachmentState(true)}`);
+    step(`composer before pasting: ${attachmentState(true)}`);
     pasteFile(file);
     try {
-      await waitFor(() => attachmentState() !== before, 8000, '');
+      await waitFor(() => attachmentState() !== before, 10000, '');
       step(`image pasted (${attachmentState(true)})`);
     } catch {
-      const input = fileInput();
-      step(`no sign of the pasted image after 8s; trying file input ${describe(input)}`);
-      if (input) chooseFile(input, file);
-      await waitFor(() => attachmentState() !== before, 8000, 'could not attach image');
-      step(`image attached through the file input (${attachmentState(true)})`);
+      step(`no sign of the pasted image after 10s; going on. Composer: ${describeComposer()}`);
     }
-    const box2 = composer();
-    if (box2 && attachmentFields(box2).length) {
-      await waitFor(() => composer() && attachedAndUploaded(composer()), 2 * 60 * 1000, 'image upload did not finish');
-      step(`upload finished (${attachmentState(true)})`);
+    const area = composerArea();
+    if (area && attachmentFields(area).length) {
+      await waitFor(() => composerArea() && attachedAndUploaded(composerArea()), 2 * 60 * 1000, 'image upload did not finish');
+    } else {
+      await settle(attachmentState, 1500, 30000);
     }
+    step(`upload finished (${attachmentState(true)})`);
     if (shot.prompt) {
       typeAtEnd(shot.prompt);
       step(`prompt typed, the box now holds ${boxLength(editor())} characters`);
     }
-    const usersBefore = userMessages().length;
+    ctx.questionsBefore = keysOf(userMessages());
     // Sending may load a new page; the copy of this script there picks the answer up from this note.
     sessionStorage.setItem(PENDING, JSON.stringify({ id: shot.id, at: Date.now() }));
-    await submit(step, usersBefore);
+    await submit(step, ctx.questionsBefore);
+    ctx.sentAt = Date.now();
     // In a background tab ChatGPT may only show the answer once it is complete, and thinking can take minutes.
-    const sentAt = Date.now();
     let described = false;
     await waitFor(() => {
-      if (!described && Date.now() - sentAt > 20000) {
+      if (!described && Date.now() - ctx.sentAt > 20000) {
         described = true;
         step(`no new answer on the page after 20s; the page now:\n${describePage()}`);
       }
-      return freshAnswers(known).length > 0;
+      return ourAnswer(ctx);
     }, 4 * 60 * 1000, 'no answer');
-    step(`answer started in ${describe(freshAnswers(known).at(-1))}`);
-    await streamAnswer(shot.id, step, known);
+    step(`answer started in ${describe(ourAnswer(ctx))}`);
+    await streamAnswer(shot.id, step, ctx);
   }
 
-  // Accepted once ChatGPT empties the box, shows the question, or starts answering.
-  const accepted = usersBefore => userMessages().length > usersBefore || generating() || boxLength(editor()) === 0;
+  // Accepted once ChatGPT empties the box, shows the new question, or starts answering.
+  const accepted = questionsBefore => fresh(userMessages(), questionsBefore).length > 0 || generating() || boxLength(editor()) === 0;
 
   // Click send; if ChatGPT doesn't take it, press Enter, then submit the form, checking after each try.
-  async function submit(step, usersBefore) {
+  async function submit(step, questionsBefore) {
     const button = await waitFor(sendButton, 60000, '').catch(() => null);
     const tries = [
       [`clicking send ${describe(button ?? anySendButton())}`, () => (button ?? anySendButton())?.click()],
@@ -280,7 +332,7 @@
       step(what);
       act();
       try {
-        await waitFor(() => accepted(usersBefore), 6000, '');
+        await waitFor(() => accepted(questionsBefore), 8000, '');
         step('sent');
         return;
       } catch {}
@@ -289,14 +341,14 @@
     throw new Error('could not send');
   }
 
-  async function streamAnswer(id, step, known = new Set()) {
-    let text = '', sent = '', changedAt = Date.now(), sentAt = 0;
+  async function streamAnswer(id, step, ctx = { known: new Set() }) {
+    let text = '', sent = '', changedAt = Date.now(), sentAt = 0, sawBusy = false;
     const deadline = Date.now() + 5 * 60 * 1000;
     try {
       for (;;) {
         await sleep(200);
-        const fresh = freshAnswers(known);
-        const now = fresh.length ? answerText(fresh[fresh.length - 1]) : '';
+        const answer = ourAnswer(ctx);
+        const now = answer ? answerText(answer) : '';
         if (now !== text) {
           text = now;
           changedAt = Date.now();
@@ -306,7 +358,10 @@
           sent = text;
           sentAt = Date.now();
         }
-        const finished = !generating() && text && Date.now() - changedAt > 1200;
+        const busy = generating();
+        sawBusy ||= busy;
+        // Without a recognisable stop button a pause in the answer could look like the end, so wait longer then.
+        const finished = !busy && text && Date.now() - changedAt > (sawBusy ? 1200 : 4000);
         if (finished || Date.now() > deadline) break;
       }
       step(Date.now() > deadline ? 'stopped following the answer after 5 minutes' : `answer finished, ${text.length} characters`);
