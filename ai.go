@@ -47,8 +47,8 @@ const (
 	cfDIB             = 8
 
 	processQueryLimitedInformation = 0x1000
-	shotMaxAge                     = 90 * time.Second
-	aiLogMax                       = 512 << 10 // the log keeps its newer half once it grows past this
+	shotMaxAge                     = 5 * time.Minute // a snip may wait this long for a ChatGPT tab busy with the previous one
+	aiLogMax                       = 512 << 10       // the log keeps its newer half once it grows past this
 )
 
 var (
@@ -62,6 +62,7 @@ var (
 	pQueryFullProcessImageNameW = kernel32.NewProc("QueryFullProcessImageNameW")
 
 	aiToken    string
+	aiTestMode string       // "1" only in test builds (-ldflags "-X main.aiTestMode=1"): TELEPROMPTER_ANY_IMAGE then works
 	cfPNG      uintptr      // registered "PNG" clipboard format, offered by some screenshot tools
 	aiLastSeen atomic.Int64 // unix nanos of the extension's last request
 	aiExtWant  string       // extension version embedded in this exe
@@ -105,6 +106,7 @@ type aiReply struct {
 
 func aiStart() {
 	aiToken = aiLoadToken()
+	aiNextID.Store(time.Now().Unix() % 1000000 * 1000)
 	aiExtSeen.Store("-")
 	var manifest struct{ Version string }
 	if b, err := extensionFiles.ReadFile("extension/manifest.json"); err == nil && json.Unmarshal(b, &manifest) == nil {
@@ -255,6 +257,7 @@ func aiServe() {
 	mux.HandleFunc("/wait", aiWaitHandler)
 	mux.HandleFunc("/answer", aiAnswerHandler)
 	mux.HandleFunc("/log", aiLogHandler)
+	mux.HandleFunc("/ping", aiPingHandler)
 	addr := "127.0.0.1:" + strconv.Itoa(aiPort)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -321,12 +324,15 @@ func aiWaitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	timeout := time.NewTimer(20 * time.Second)
 	defer timeout.Stop()
-	defer aiLastSeen.Store(time.Now().UnixNano())
+	defer func() { aiLastSeen.Store(time.Now().UnixNano()) }()
 	for {
 		select {
 		case s := <-aiShots:
 			if time.Since(s.at) > shotMaxAge {
 				aiLog("snip #%d dropped: no ChatGPT tab took it within %s", s.ID, shotMaxAge)
+				if s.ID == aiCurrent.Load() {
+					aiPostError("ChatGPT didn't take the snip")
+				}
 				continue
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -370,11 +376,25 @@ func aiAnswerHandler(w http.ResponseWriter, r *http.Request) {
 	case aiLogStarted.Swap(a.ID) != a.ID:
 		aiLog("snip #%d: answer arriving in the bar", a.ID)
 	}
+	if a.ID != aiCurrent.Load() {
+		if a.Done || a.Error != "" {
+			aiLog("snip #%d: answer not shown, a newer snip was taken", a.ID)
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	aiMu.Lock()
 	aiAnswer = a
 	aiMu.Unlock()
 	call(pPostMessageW, hMain, wmAIAnswer, 0, 0)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// The extension's heartbeat while a tab is busy with a snip; aiAuthorized notes the contact.
+func aiPingHandler(w http.ResponseWriter, r *http.Request) {
+	if aiAuthorized(w, r) {
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 // Progress lines from the extension, so the steps inside ChatGPT are in the same log.
@@ -424,9 +444,8 @@ func aiOnClipboard() {
 		return
 	}
 	// Snipping Tool can publish the same snip more than once.
-	if h := sha256.Sum256(data); h != aiLastHash || time.Since(aiLastHashAt) > 10*time.Second {
-		aiLastHash, aiLastHashAt = h, time.Now()
-	} else {
+	hash := sha256.Sum256(data)
+	if hash == aiLastHash && time.Since(aiLastHashAt) < 10*time.Second {
 		return
 	}
 	// Without a connected ChatGPT tab the snip is dropped rather than queued, so it can't be sent unexpectedly later.
@@ -446,6 +465,7 @@ func aiOnClipboard() {
 		render()
 		return
 	}
+	aiLastHash, aiLastHashAt = hash, time.Now()
 	id := aiNextID.Add(1)
 	aiCurrent.Store(id)
 	aiLog("snip #%d: %s image of %d KB from %s, asking ChatGPT", id, kind, len(data)>>10, owner)
@@ -471,26 +491,27 @@ func aiOnClipboard() {
 	}()
 }
 
-// Only Win+Shift+S snips are sent, not every image copied elsewhere. If the owner can't be identified, the image is accepted.
+// Only images Snipping Tool (Win+Shift+S) put on the clipboard are sent. Images from any other app, or from one
+// that can't be identified, are ignored, so nothing else copied ever reaches ChatGPT.
 func aiClipboardOwner() (name string, fromSnip bool) {
-	if os.Getenv("TELEPROMPTER_ANY_IMAGE") == "1" {
+	if aiTestMode == "1" && os.Getenv("TELEPROMPTER_ANY_IMAGE") == "1" {
 		return "any app (test mode)", true
 	}
 	owner := call(pGetClipboardOwner)
 	if owner == 0 {
-		return "an unknown app", true
+		return "an unknown app", false
 	}
 	var pid uint32
 	call(pGetWindowThreadProcessId, owner, uintptr(unsafe.Pointer(&pid)))
 	h := call(pOpenProcess, processQueryLimitedInformation, 0, uintptr(pid))
 	if h == 0 {
-		return "process " + strconv.Itoa(int(pid)), true
+		return "process " + strconv.Itoa(int(pid)), false
 	}
 	defer call(pCloseHandle, h)
 	buf := make([]uint16, 1024)
 	n := uint32(len(buf))
 	if call(pQueryFullProcessImageNameW, h, 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&n))) == 0 {
-		return "process " + strconv.Itoa(int(pid)), true
+		return "process " + strconv.Itoa(int(pid)), false
 	}
 	name = filepath.Base(syscall.UTF16ToString(buf[:n]))
 	lower := strings.ToLower(name)
@@ -568,8 +589,8 @@ func dibToPNG(b []byte) ([]byte, error) {
 
 func aiShowAnswer(a aiReply) {
 	if locked || a.ID != aiCurrent.Load() {
-		if a.Done || a.Error != "" {
-			aiLog("snip #%d: answer not shown (a newer snip was taken, or the bar is locked)", a.ID)
+		if (a.Done || a.Error != "") && locked {
+			aiLog("snip #%d: answer not shown, the bar is locked", a.ID)
 		}
 		return
 	}

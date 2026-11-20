@@ -93,9 +93,10 @@
     'button[data-composer-submit][data-stop-generating], [data-testid="stop-button"], button[aria-label^="Stop" i]').length > 0;
 
   function anySendButton() {
-    const isStop = b => b.hasAttribute('data-stop-generating') || /^stop/i.test(b.getAttribute('aria-label') || '');
+    const isStop = b => b.hasAttribute('data-stop-generating') || b.matches('[data-testid="stop-button"]')
+      || /^stop/i.test(b.getAttribute('aria-label') || '');
     return [...(composer() || document).querySelectorAll(SEND)].find(b => !isStop(b))
-      || findAll('[data-testid="send-button"], #composer-submit-button')[0] || null;
+      || findAll('[data-testid="send-button"], #composer-submit-button').find(b => !isStop(b)) || null;
   }
 
   function sendButton() {
@@ -222,6 +223,7 @@
   async function waitFor(check, ms, failure) {
     const end = Date.now() + ms;
     for (;;) {
+      if (!current()) throw new Error('replaced by a newer copy of the extension');
       const v = check();
       if (v) return v;
       if (Date.now() > end) throw new Error(failure);
@@ -238,6 +240,21 @@
 
   // An emptied rich-text box still holds a line break, so whitespace doesn't count.
   const boxLength = el => (!el ? '?' : (el instanceof HTMLTextAreaElement ? el.value : el.innerText).trim().length);
+
+  function clearBox() {
+    const el = editor();
+    el.focus();
+    if (el instanceof HTMLTextAreaElement) {
+      el.select();
+      if (!document.execCommand('delete')) {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(el, '');
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      return;
+    }
+    window.getSelection().selectAllChildren(el);
+    document.execCommand('delete');
+  }
 
   function typeAtEnd(text) {
     const el = editor();
@@ -263,8 +280,12 @@
   function answerBody(msg) {
     const inside = msg.querySelectorAll(BODY);
     if (inside.length) return inside[inside.length - 1];
+    const turn = msg.closest('[data-turn-key], [data-virtualized-turn]');
+    return (turn && bodyAfter(msg, [...turn.querySelectorAll(`${MESSAGE}, ${BODY}`)])) || bodyAfter(msg, findAll(`${MESSAGE}, ${BODY}`));
+  }
+  function bodyAfter(msg, list) {
     let after = false, body = null;
-    for (const el of findAll(`${MESSAGE}, ${BODY}`)) {
+    for (const el of list) {
       if (el === msg) {
         after = true;
       } else if (after) {
@@ -289,10 +310,15 @@
     step(`reached the ChatGPT tab ${where()}`);
     const box = await waitFor(editor, 15000, 'chat box not found');
     step(`chat box ${describe(box)} in ${describe(composer())}`);
-    const ctx = { known: keysOf(assistantMessages()), lastBefore: answerText(assistantMessages().at(-1) ?? document.createElement('i')) };
+    const ctx = {}; // what was on the page just before sending, filled in below
     const bytes = Uint8Array.from(atob(shot.png), c => c.charCodeAt(0));
     const file = new File([bytes], `screenshot-${shot.id}.png`, { type: 'image/png' });
 
+    const leftover = boxLength(editor());
+    if (leftover) {
+      clearBox();
+      step(`cleared ${leftover} characters left in the chat box (now ${boxLength(editor())})`);
+    }
     // Paste like a user would, once: ChatGPT takes pasted images, and attaching another way as well added it twice.
     const before = attachmentState();
     step(`composer before pasting: ${attachmentState(true)}`);
@@ -314,9 +340,16 @@
       typeAtEnd(shot.prompt);
       step(`prompt typed, the box now holds ${boxLength(editor())} characters`);
     }
+    if (generating()) {
+      step('ChatGPT is still answering the previous question; waiting for it to finish');
+      await waitFor(() => !generating(), 5 * 60 * 1000, 'ChatGPT kept answering the previous question');
+    }
+    ctx.known = keysOf(assistantMessages());
+    ctx.lastBefore = answerText(assistantMessages().at(-1) ?? document.createElement('i'));
     ctx.questionsBefore = keysOf(userMessages());
     // Sending may load a new page; the copy of this script there picks the answer up from this note.
-    sessionStorage.setItem(PENDING, JSON.stringify({ id: shot.id, at: Date.now() }));
+    const ids = set => [...set].filter(k => typeof k === 'string');
+    sessionStorage.setItem(PENDING, JSON.stringify({ id: shot.id, at: Date.now(), known: ids(ctx.known), questions: ids(ctx.questionsBefore) }));
     await submit(step, ctx.questionsBefore);
     ctx.sentAt = Date.now();
     // In a background tab ChatGPT may only show the answer once it is complete, and thinking can take minutes.
@@ -395,6 +428,7 @@
   }
 
   function fail(id, e) {
+    if (!current()) return;
     sessionStorage.removeItem(PENDING);
     let debug = '';
     try {
@@ -418,10 +452,11 @@
     }
     const step = stepper(pending.id);
     step(`page changed after sending; following the answer on ${where()}`);
+    const ctx = { known: new Set(pending.known ?? []), questionsBefore: pending.questions ? new Set(pending.questions) : undefined };
     try {
       await waitFor(() => generating(), 15000, '').catch(() => {});
-      await waitFor(() => assistantMessages().length, 4 * 60 * 1000, 'no answer');
-      await streamAnswer(pending.id, step);
+      await waitFor(() => ourAnswer(ctx), 4 * 60 * 1000, 'no answer');
+      await streamAnswer(pending.id, step, ctx);
     } catch (e) {
       fail(pending.id, e);
     }
