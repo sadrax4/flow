@@ -79,6 +79,7 @@ const (
 	dtSingleLine  = 0x0020
 	dtCalcRect    = 0x0400
 	dtNoPrefix    = 0x0800
+	dtEndEllipsis = 0x8000
 
 	errAlreadyExists = 183
 
@@ -555,7 +556,7 @@ func ensureBuffer() {
 
 func drawLabel(s string, r rect, color uintptr) {
 	call(pSetTextColor, memDC, color)
-	call(pDrawTextW, memDC, uintptr(unsafe.Pointer(str(s))), ^uintptr(0), uintptr(unsafe.Pointer(&r)), dtCenter|dtVCenter|dtSingleLine|dtNoPrefix)
+	call(pDrawTextW, memDC, uintptr(unsafe.Pointer(str(s))), ^uintptr(0), uintptr(unsafe.Pointer(&r)), dtCenter|dtVCenter|dtSingleLine|dtNoPrefix|dtEndEllipsis)
 	call(pSetTextColor, memDC, colorText)
 }
 
@@ -610,7 +611,7 @@ func draw() {
 	if toastActive() {
 		var size rect
 		call(pDrawTextW, memDC, uintptr(unsafe.Pointer(str(toast))), ^uintptr(0), uintptr(unsafe.Pointer(&size)), dtCalcRect|dtSingleLine|dtNoPrefix)
-		pill := rect{bufW - px(10) - (size.Right - size.Left) - px(20), 0, bufW - px(10), bufH}
+		pill := rect{max(px(4), bufW-px(10)-(size.Right-size.Left)-px(20)), 0, bufW - px(10), bufH}
 		call(pFillRect, memDC, uintptr(unsafe.Pointer(&pill)), toastBrush)
 		drawLabel(toast, pill, toastColor)
 	}
@@ -742,13 +743,22 @@ func tick() {
 	}
 }
 
-func setText(s string) {
-	stopAnim()
+func setText(s string) { showText(s, false) }
+
+// keepPos leaves the reading position (and any glide) alone, for text that grows while it is being read.
+func showText(s string, keepPos bool) {
+	if !keepPos {
+		stopAnim()
+	}
 	var truncated bool
 	text, truncated = limitText(normalize(s))
 	allSelected = false
 	shape()
-	pos, target = 0, 0
+	if keepPos {
+		pos, target = clampPos(pos), clampPos(target)
+	} else {
+		pos, target = 0, 0
+	}
 	render()
 	if truncated {
 		showToast("Too long: first part loaded", colorWarn, 4*time.Second)
@@ -1112,6 +1122,9 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 		call(pPostQuitMessage, 0)
 		return 0
 	}
+	if aiMessage(msg, wp, lp) {
+		return 0
+	}
 	return call(pDefWindowProcW, hwnd, uintptr(msg), wp, lp)
 }
 
@@ -1189,6 +1202,7 @@ func main() {
 	call(pShowWindow, hMain, 5)
 	call(pSetForegroundWindow, hMain)
 	call(pSetFocus, hMain)
+	aiStart()
 	shape()
 	if haveCfg {
 		pos = clampPos(cfg.Pos)
