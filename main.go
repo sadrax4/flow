@@ -1224,6 +1224,8 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 		case toastTimer:
 			call(pKillTimer, hwnd, toastTimer)
 			render()
+		default:
+			aiMessage(msg, wp, lp)
 		}
 		return 0
 	case wmEndSession:

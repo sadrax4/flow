@@ -10,6 +10,10 @@
   const current = () => window.teleprompterInstance === instance && !!chrome.runtime?.id;
 
   const PENDING = 'teleprompter-pending-answer';
+  // Phrasly refuses text under 30 words or 50 characters ("Text must be at least 30 words."), so such answers
+  // go straight to the bar.
+  const PHRASLY_MIN_WORDS = 30;
+  const PHRASLY_MIN_CHARS = 50;
   const STOPPED = 'stopped: a new snip came';
   // The pending note belongs to one snip; an older one's clean-up must not remove a newer snip's note.
   function clearPending(id) {
@@ -449,8 +453,14 @@
       }
       const complete = Date.now() <= deadline;
       step(complete ? `answer finished, ${text.length} characters` : 'stopped following the answer after 5 minutes');
-      if (humanizer && complete && text) {
-        send({ type: 'humanize', id, text }); // Phrasly's version goes to the bar, or this text if it can't humanize it
+      const words = (text.match(/\S+/g) ?? []).length;
+      if (humanizer && complete && text && (words < PHRASLY_MIN_WORDS || text.length < PHRASLY_MIN_CHARS)) {
+        step(`too short for Phrasly (${words} words; it needs ${PHRASLY_MIN_WORDS}), so the bar shows this answer`);
+        report({ id, text, done: true });
+      } else if (humanizer && complete && text) {
+        // The app keeps this text and shows it if Phrasly's version doesn't come in time.
+        report({ id, stage: 'humanize-pending', text });
+        send({ type: 'humanize', id, text });
       } else {
         report({ id, text, done: true });
       }

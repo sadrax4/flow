@@ -44,6 +44,7 @@ const (
 	wmClipboardUpdate = 0x031D
 	wmAIAnswer        = 0x8001 // WM_APP+1
 	wmAIError         = 0x8002
+	fallbackTimer     = 40 // shows ChatGPT's answer if Phrasly's version doesn't come in time
 	cfDIB             = 8
 
 	processQueryLimitedInformation = 0x1000
@@ -84,9 +85,12 @@ var (
 	aiRefusedLogAt atomic.Int64 // unix nanos of the last logged refusal, so a busy website can't flood the log
 
 	// UI thread only.
-	aiShownID    int64
-	aiLastHash   [32]byte
-	aiLastHashAt time.Time
+	aiFallbackID    int64 // snip whose ChatGPT answer waits for Phrasly's version
+	aiFallbackText  string
+	aiFallbackShown int64 // snip whose ChatGPT answer was shown because Phrasly's version didn't come
+	aiShownID       int64
+	aiLastHash      [32]byte
+	aiLastHashAt    time.Time
 )
 
 type aiShot struct {
@@ -103,8 +107,9 @@ type aiReply struct {
 	Error string `json:"error"`
 	Debug string `json:"debug"` // page structure sent with an error, written to the log
 	// "" for ChatGPT's answer. With a Phrasly humanizer tab open the bar shows no text until Phrasly's version:
-	// the extension sends "answering" and "humanizing" (no text), then "humanized" with Phrasly's text, or an
-	// error with "humanize" and ChatGPT's text to show instead.
+	// the extension sends "answering" (no text), "humanize-pending" with ChatGPT's text (shown if Phrasly's
+	// version doesn't come in time), "humanizing", then "humanized" with Phrasly's text, or an error with
+	// "humanize" and ChatGPT's text to show instead.
 	Stage string `json:"stage"`
 }
 
@@ -187,6 +192,12 @@ func aiMessage(msg uint32, wp, lp uintptr) bool {
 		aiMu.Unlock()
 		showToast(e, colorError, 4*time.Second)
 		render()
+	case wmTimer:
+		if wp != fallbackTimer {
+			return false
+		}
+		call(pKillTimer, hMain, fallbackTimer)
+		aiShowFallback("Phrasly took too long")
 	default:
 		return false
 	}
@@ -382,6 +393,9 @@ func aiAnswerHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	case a.Stage == "answering":
 		aiLog("snip #%d: ChatGPT is answering; the bar waits for Phrasly's version", a.ID)
+	case a.Stage == "humanize-pending":
+		aiLog("snip #%d: ChatGPT answered (%d characters); waiting up to %s for Phrasly's version", a.ID,
+			utf8.RuneCountInString(a.Text), aiFallbackWait(a.Text))
 	case a.Stage == "humanizing":
 		aiLog("snip #%d: Phrasly is humanizing the answer", a.ID)
 	case a.Stage == "humanized":
@@ -603,6 +617,37 @@ func dibToPNG(b []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+// A "ChatGPT is answering..." or "Humanizing..." note goes once the answer is in the bar.
+func clearStatusToast() {
+	if toast == "ChatGPT is answering..." || toast == "Humanizing..." {
+		toastUntil = time.Time{}
+		render()
+	}
+}
+
+// How long ChatGPT's answer waits for Phrasly's version: longer answers take Phrasly longer.
+func aiFallbackWait(text string) time.Duration {
+	words := len(strings.Fields(text))
+	return min(45*time.Second+time.Duration(words)*50*time.Millisecond, 90*time.Second)
+}
+
+// Shows ChatGPT's answer when Phrasly's version won't come: refused, failed, or too slow.
+func aiShowFallback(why string) {
+	id := aiFallbackID
+	if id == 0 || id != aiCurrent.Load() || aiFallbackText == "" {
+		return
+	}
+	aiFallbackID, aiFallbackShown = 0, id
+	aiLog("snip #%d: %s; showing ChatGPT's answer", id, why)
+	if !locked {
+		showText(aiFallbackText, false)
+		aiShownID = id
+		autoStart()
+		showToast(why, colorWarn, 4*time.Second)
+		render()
+	}
+}
+
 func aiShowAnswer(a aiReply) {
 	if locked || a.ID != aiCurrent.Load() {
 		if (a.Done || a.Error != "") && locked {
@@ -610,16 +655,22 @@ func aiShowAnswer(a aiReply) {
 		}
 		return
 	}
+	if (a.Stage == "humanized" || a.Stage == "humanize") && a.ID == aiFallbackShown {
+		aiLog("snip #%d: Phrasly's reply came after ChatGPT's answer was shown; the bar keeps that", a.ID)
+		return
+	}
 	switch {
+	case a.Stage == "humanize-pending":
+		aiFallbackID, aiFallbackText = a.ID, a.Text
+		call(pSetTimer, hMain, fallbackTimer, uintptr(aiFallbackWait(a.Text).Milliseconds()), 0)
+		return
 	case a.Error != "" && a.Stage == "humanize":
 		// Phrasly couldn't humanize it, so the bar shows ChatGPT's answer after all.
+		call(pKillTimer, hMain, fallbackTimer)
 		if strings.TrimSpace(a.Text) != "" {
-			showText(a.Text, false)
-			aiShownID = a.ID
-			autoStart()
+			aiFallbackID, aiFallbackText = a.ID, a.Text
 		}
-		showToast("Phrasly: "+a.Error, colorWarn, 5*time.Second)
-		render()
+		aiShowFallback("Phrasly: " + a.Error)
 		return
 	case a.Error != "":
 		showToast("ChatGPT: "+a.Error, colorError, 5*time.Second)
@@ -636,6 +687,8 @@ func aiShowAnswer(a aiReply) {
 	case strings.TrimSpace(a.Text) == "":
 		return
 	case a.Stage == "humanized":
+		call(pKillTimer, hMain, fallbackTimer)
+		aiFallbackID = 0
 		showText(a.Text, false) // a new text, read from the start
 		aiShownID = a.ID
 		autoStart()
@@ -645,7 +698,12 @@ func aiShowAnswer(a aiReply) {
 	}
 	showText(a.Text, a.ID == aiShownID)
 	aiShownID = a.ID
-	if a.Done { // ChatGPT's final answer (no Phrasly humanizer open)
+	if a.Done { // ChatGPT's final answer: no Phrasly humanizer open, too short for Phrasly, or its tab was closed
+		if a.ID == aiFallbackID {
+			call(pKillTimer, hMain, fallbackTimer)
+			aiFallbackID = 0
+		}
+		clearStatusToast()
 		autoStart()
 	}
 }

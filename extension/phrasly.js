@@ -121,6 +121,7 @@
   }
 
   const busy = pane => !!stopButton() || BUSY.test(statusText()) || !!pane?.querySelector('[aria-busy="true"]');
+  const REFUSAL = /at least \d+ words|under \d+ words|minimum \d+ words|upgrade to continue|limit reached|ran out|no words left|try again/i;
 
   // Notices on screen (word limits, upgrade prompts, errors), for the error message and the log.
   function notices() {
@@ -192,16 +193,21 @@
       step(`answer put into ${describe(input)} (Phrasly counts ${countedWords() ?? '?'} words)`);
       report({ id, stage: 'humanizing' });
 
-      const button = await waitFor(() => enabled(humanizeButton()) && humanizeButton(), 8000, '').catch(() => null);
+      const button = await waitFor(() => enabled(humanizeButton()) && humanizeButton(), 4000, '').catch(() => null);
       if (!button) {
         const why = notices()[0];
         throw new Error(why ? why : humanizeButton() ? `the Humanize button stayed disabled (the answer has ${wordCount(text)} words)` : 'Humanize button not found');
       }
       step(`clicking ${describe(button)}"${label(button)}"`);
+      // Phrasly answers a refusal ("Text must be at least 30 words.", word limits, upgrade prompts) with a toast;
+      // only a message that wasn't on the page before the click counts.
+      const shownBefore = new Set(notices());
       button.click();
-      await waitFor(() => busy(pane) || outputText(outputPane(input)) !== before, 15000, '').catch(() => {
+      const refusal = () => notices().find(t => REFUSAL.test(t) && !shownBefore.has(t));
+      await waitFor(() => busy(pane) || outputText(outputPane(input)) !== before || refusal(), 12000, '').catch(() => {
         throw new Error(notices()[0] ?? 'the humanizer did not start');
       });
+      if (!busy(pane) && refusal()) throw new Error(refusal());
       step(`working (status "${statusText()}")`);
 
       // Done once nothing is busy and the output has stayed the same for 2s (a hidden tab gets it all at the end).
