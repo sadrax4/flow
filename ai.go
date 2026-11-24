@@ -102,6 +102,9 @@ type aiReply struct {
 	Done  bool   `json:"done"`
 	Error string `json:"error"`
 	Debug string `json:"debug"` // page structure sent with an error, written to the log
+	// "" for ChatGPT's answer; with a Phrasly humanizer tab open the extension then sends "humanizing", and
+	// "humanized" with Phrasly's version of the text, or an error with "humanize".
+	Stage string `json:"stage"`
 }
 
 func aiStart() {
@@ -366,11 +369,20 @@ func aiAnswerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case a.Error != "" && a.Stage == "humanize":
+		aiLog("snip #%d: Phrasly could not humanize the answer: %s", a.ID, a.Error)
+		if a.Debug != "" {
+			aiLog("Phrasly page at that moment:\n%s", a.Debug)
+		}
 	case a.Error != "":
 		aiLog("snip #%d failed in Chrome: %s", a.ID, a.Error)
 		if a.Debug != "" {
 			aiLog("ChatGPT page at that moment:\n%s", a.Debug)
 		}
+	case a.Stage == "humanizing":
+		aiLog("snip #%d: Phrasly is humanizing the answer", a.ID)
+	case a.Stage == "humanized":
+		aiLog("snip #%d humanized by Phrasly: %d characters", a.ID, utf8.RuneCountInString(a.Text))
 	case a.Done:
 		aiLog("snip #%d answered: %d characters", a.ID, utf8.RuneCountInString(a.Text))
 	case aiLogStarted.Swap(a.ID) != a.ID:
@@ -594,12 +606,27 @@ func aiShowAnswer(a aiReply) {
 		}
 		return
 	}
-	if a.Error != "" {
+	switch {
+	case a.Error != "" && a.Stage == "humanize":
+		// ChatGPT's answer stays in the bar.
+		showToast("Phrasly: "+a.Error, colorWarn, 5*time.Second)
+		render()
+		return
+	case a.Error != "":
 		showToast("ChatGPT: "+a.Error, colorError, 5*time.Second)
 		render()
 		return
-	}
-	if strings.TrimSpace(a.Text) == "" {
+	case a.Stage == "humanizing":
+		showToast("Humanizing...", colorAccent, 3*time.Second)
+		render()
+		return
+	case strings.TrimSpace(a.Text) == "":
+		return
+	case a.Stage == "humanized":
+		showText(a.Text, false) // a new text, read from the start
+		aiShownID = a.ID
+		showToast("Humanized", colorAccent, 2*time.Second)
+		render()
 		return
 	}
 	showText(a.Text, a.ID == aiShownID)

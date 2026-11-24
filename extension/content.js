@@ -420,8 +420,11 @@
         const finished = !busy && text && Date.now() - changedAt > (sawBusy ? 1200 : 4000);
         if (finished || Date.now() > deadline) break;
       }
-      step(Date.now() > deadline ? 'stopped following the answer after 5 minutes' : `answer finished, ${text.length} characters`);
+      const complete = Date.now() <= deadline;
+      step(complete ? `answer finished, ${text.length} characters` : 'stopped following the answer after 5 minutes');
       report({ id, text, done: true });
+      // With a Phrasly humanizer tab open, the finished answer goes there next and the bar then shows its version.
+      if (complete && text) send({ type: 'humanize', id, text });
     } finally {
       sessionStorage.removeItem(PENDING);
     }

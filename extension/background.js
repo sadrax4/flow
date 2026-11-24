@@ -133,11 +133,34 @@ chrome.runtime.onConnect.addListener(port => {
 
 chrome.tabs.onRemoved.addListener(tabId => busy.delete(tabId));
 
-// After an install or an update, start in the ChatGPT tabs that are already open, so they need no refresh.
+// With a Phrasly AI Humanizer tab open, a finished answer goes there to be humanized; the bar then shows that version.
+// Without one, the bar keeps ChatGPT's answer.
+const PHRASLY = ['https://phrasly.ai/*', 'https://www.phrasly.ai/*'];
+async function humanize(id, text) {
+  const tabs = await chrome.tabs.query({ url: PHRASLY }).catch(() => []);
+  const tab = tabs.find(t => /\/humanizer/i.test(new URL(t.url).pathname));
+  if (!tab) {
+    post('/log', { line: `snip #${id}: no Phrasly humanizer tab is open, so the bar keeps ChatGPT's answer` });
+    return;
+  }
+  const message = { type: 'humanize', id, text };
+  try {
+    await chrome.tabs.sendMessage(tab.id, message);
+  } catch {
+    // The tab was opened before the extension was loaded: start the script there and try once more.
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['phrasly.js'] }).catch(() => {});
+    await chrome.tabs.sendMessage(tab.id, message).catch(() =>
+      post('/answer', { id, stage: 'humanize', error: 'the Phrasly tab did not respond; refresh it' }));
+  }
+}
+
+// After an install or an update, start in the ChatGPT and Phrasly tabs that are already open, so they need no refresh.
 chrome.runtime.onInstalled.addListener(async () => {
-  const tabs = await chrome.tabs.query({ url: CHATGPT }).catch(() => []);
-  for (const tab of tabs) {
-    chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }).catch(() => {});
+  for (const [urls, file] of [[CHATGPT, 'content.js'], [PHRASLY, 'phrasly.js']]) {
+    const tabs = await chrome.tabs.query({ url: urls }).catch(() => []);
+    for (const tab of tabs) {
+      chrome.scripting.executeScript({ target: { tabId: tab.id }, files: [file] }).catch(() => {});
+    }
   }
 });
 
@@ -152,6 +175,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       return false;
     case 'answer':
       post('/answer', msg.answer);
+      return false;
+    case 'humanize':
+      humanize(msg.id, msg.text);
       return false;
   }
   return false;
