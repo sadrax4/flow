@@ -70,12 +70,26 @@
     return boxes.find(el => /paste it here/i.test(hintOf(el))) ?? boxes.sort((a, b) => area(b) - area(a))[0] ?? null;
   }
 
-  // Buttons by their label: "Humanize" (or "Re-Humanize" once there is output), and "Stop" while it works.
+  // The Humanize button: Phrasly marks it data-humanizer-primary (and data-paraphrasing while it works); otherwise
+  // the button labelled "Humanize" (or "Re-Humanize" once there is output). It reads "Stop" while working.
   const label = b => (b.innerText || b.getAttribute('aria-label') || '').trim();
   const buttons = () => [...document.querySelectorAll('button, [role="button"]')].filter(visible);
-  const humanizeButton = () => buttons().find(b => /^(re-?)?humanize$/i.test(label(b))) ?? null;
-  const stopButton = () => buttons().find(b => /^stop$/i.test(label(b))) ?? null;
+  const humanizeButton = () => buttons().find(b => b.hasAttribute('data-humanizer-primary') && !b.hasAttribute('data-paraphrasing'))
+    ?? buttons().find(b => /^(re-?)?humanize$/i.test(label(b))) ?? null;
+  const stopButton = () => buttons().find(b => b.hasAttribute('data-paraphrasing') || /^stop$/i.test(label(b))) ?? null;
   const enabled = b => !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+
+  // Phrasly's own word count under the input ("38 / 5,000 Words"): it only changes once the page has taken the text.
+  const countedWords = () => {
+    const n = findText(/^\s*[\d,]+\s*\/\s*[\d,]+\s*words\s*$/i);
+    return n ? Number(n.data.trim().split('/')[0].replace(/[^\d]/g, '')) : null;
+  };
+  const pasteButtonShown = () => buttons().some(b => /^paste text$/i.test(label(b)));
+  // Taken: the count is up from zero, or (with no count on the page) the empty-box buttons are gone.
+  const taken = () => {
+    const n = countedWords();
+    return n === null ? !pasteButtonShown() : n > 0;
+  };
 
   // The status line: "Waiting for your input..." when idle; "Humanizing content...", "Proofreading..." and the like
   // while it works.
@@ -165,7 +179,17 @@
       const before = outputText(pane);
       setInput(input, text);
       await waitFor(() => same(textOf(inputBox()), text), 5000, 'could not put the answer into the input box');
-      step(`answer put into ${describe(input)}`);
+      // In a background tab the page can miss that edit (the box shows the text but Phrasly's own state stays
+      // empty, and Humanize then does nothing). If its word count doesn't move, hand the text to the box's own
+      // change handler, from inside the page.
+      const counted = await waitFor(taken, 1500, '').catch(() => false);
+      if (!counted) {
+        const countBefore = countedWords();
+        const how = await chrome.runtime.sendMessage({ type: 'phrasly-set', text }).catch(e => String(e));
+        step(`the page didn't take the typed text (it counted ${countBefore ?? '?'} words); set it through its change handler: ${how}`);
+        await waitFor(() => same(textOf(inputBox()), text) && taken(), 5000, `Phrasly didn't take the text (${how})`);
+      }
+      step(`answer put into ${describe(input)} (Phrasly counts ${countedWords() ?? '?'} words)`);
       report({ id, stage: 'humanizing' });
 
       const button = await waitFor(() => enabled(humanizeButton()) && humanizeButton(), 8000, '').catch(() => null);

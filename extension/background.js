@@ -140,6 +140,27 @@ async function humanizerTab() {
   const tabs = await chrome.tabs.query({ url: PHRASLY }).catch(() => []);
   return tabs.find(t => /\/humanizer/i.test(new URL(t.url).pathname)) ?? null;
 }
+// Runs inside the Phrasly page (not the extension's isolated view of it): gives the input box's React change
+// handler the text, as typing would. Used when a background tab missed the typed edit.
+function reactSetInput(text) {
+  const box = [...document.querySelectorAll('textarea')].find(t => /paste it here/i.test(t.placeholder || '')) ?? document.querySelector('textarea');
+  if (!box) return 'no input box';
+  const key = Object.keys(box).find(k => k.startsWith('__reactProps$'));
+  const onChange = key && box[key]?.onChange;
+  if (typeof onChange !== 'function') return 'no change handler';
+  Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(box, text);
+  onChange({ target: box, currentTarget: box, type: 'change', nativeEvent: new Event('input'), preventDefault() {}, stopPropagation() {}, persist() {} });
+  return 'done';
+}
+async function setInPage(tabId, text) {
+  try {
+    const [res] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: reactSetInput, args: [text] });
+    return res?.result ?? 'no result';
+  } catch (e) {
+    return `could not run in the page: ${e.message || e}`;
+  }
+}
+
 async function humanize(id, text) {
   const tab = await humanizerTab();
   if (!tab) {
@@ -186,6 +207,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       return false;
     case 'humanizer':
       humanizerTab().then(tab => reply({ open: !!tab }));
+      return true;
+    case 'phrasly-set':
+      setInPage(_sender.tab.id, msg.text).then(reply);
       return true;
   }
   return false;

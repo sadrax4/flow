@@ -10,6 +10,15 @@
   const current = () => window.teleprompterInstance === instance && !!chrome.runtime?.id;
 
   const PENDING = 'teleprompter-pending-answer';
+  const STOPPED = 'stopped: a new snip came';
+  // The pending note belongs to one snip; an older one's clean-up must not remove a newer snip's note.
+  function clearPending(id) {
+    try {
+      if (JSON.parse(sessionStorage.getItem(PENDING))?.id === id) sessionStorage.removeItem(PENDING);
+    } catch {
+      sessionStorage.removeItem(PENDING);
+    }
+  }
   const SEND = 'button[data-composer-submit], [data-testid="send-button"], #composer-submit-button, ' +
     'button[type="submit"], button[aria-label*="Send" i]';
 
@@ -220,10 +229,12 @@
     return text && text !== ctx.lastBefore ? last : null;
   }
 
-  async function waitFor(check, ms, failure) {
+  // `alive` lets a caller be called off (a page-change follow-up stops when a new snip comes).
+  async function waitFor(check, ms, failure, alive) {
     const end = Date.now() + ms;
     for (;;) {
       if (!current()) throw new Error('replaced by a newer copy of the extension');
+      if (alive && !alive()) throw new Error(STOPPED);
       const v = check();
       if (v) return v;
       if (Date.now() > end) throw new Error(failure);
@@ -410,6 +421,7 @@
     try {
       for (;;) {
         await sleep(200);
+        if (ctx.alive && !ctx.alive()) throw new Error(STOPPED);
         const answer = ourAnswer(ctx);
         const now = answer ? answerText(answer) : '';
         if (!now && !described && Date.now() - startedAt > 20000) {
@@ -443,13 +455,13 @@
         report({ id, text, done: true });
       }
     } finally {
-      sessionStorage.removeItem(PENDING);
+      clearPending(id);
     }
   }
 
   function fail(id, e) {
     if (!current()) return;
-    sessionStorage.removeItem(PENDING);
+    clearPending(id);
     let debug = '';
     try {
       debug = describePage();
@@ -460,25 +472,38 @@
   }
 
   // After a page change mid-answer: give the answer a moment to start streaming, then follow it.
+  // Runs beside the wait for new snips, never in its way: a new snip calls it off. A note is followed only once
+  // and only within 2 minutes of sending, so a page that keeps reloading can't hold the tab up.
+  let following = 0;
   async function resumePending() {
     let pending;
     try {
       pending = JSON.parse(sessionStorage.getItem(PENDING));
     } catch {}
     if (!pending) return;
-    if (Date.now() - pending.at > 5 * 60 * 1000) {
+    if (Date.now() - pending.at > 2 * 60 * 1000 || pending.tries >= 1) {
       sessionStorage.removeItem(PENDING);
       return;
     }
+    sessionStorage.setItem(PENDING, JSON.stringify({ ...pending, tries: (pending.tries ?? 0) + 1 }));
+    const token = ++following;
+    const alive = () => token === following;
     const step = stepper(pending.id);
     step(`page changed after sending; following the answer on ${where()}`);
-    const ctx = { known: new Set(pending.known ?? []), questionsBefore: pending.questions ? new Set(pending.questions) : undefined };
+    const ctx = { known: new Set(pending.known ?? []), questionsBefore: pending.questions ? new Set(pending.questions) : undefined, alive };
     try {
-      await waitFor(() => generating(), 15000, '').catch(() => {});
-      await waitFor(() => ourAnswer(ctx), 4 * 60 * 1000, 'no answer');
+      await waitFor(() => generating(), 15000, '', alive).catch(e => {
+        if (e.message === STOPPED) throw e;
+      });
+      await waitFor(() => ourAnswer(ctx), 2 * 60 * 1000, 'no answer', alive);
       await streamAnswer(pending.id, step, ctx);
     } catch (e) {
-      fail(pending.id, e);
+      if (e.message === STOPPED) {
+        step('stopped following it: a new snip came');
+        clearPending(pending.id);
+      } else {
+        fail(pending.id, e);
+      }
     }
   }
 
@@ -502,7 +527,7 @@
 
   async function main() {
     log(`ready on ${where()}`);
-    await resumePending();
+    resumePending(); // beside the wait for new snips
     for (;;) {
       if (!current()) return;
       const asked = Date.now();
@@ -513,6 +538,7 @@
         if (msg.error || Date.now() - asked < 1000) await sleep(3000);
         continue;
       }
+      following++; // a page-change follow-up of an earlier snip stops here
       const step = stepper(msg.shot.id);
       try {
         await handle(msg.shot, step);
