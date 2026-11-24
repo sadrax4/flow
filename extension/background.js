@@ -136,11 +136,16 @@ chrome.tabs.onRemoved.addListener(tabId => busy.delete(tabId));
 // With a Phrasly AI Humanizer tab open, a finished answer goes there to be humanized; the bar then shows that version.
 // Without one, the bar keeps ChatGPT's answer.
 const PHRASLY = ['https://phrasly.ai/*', 'https://www.phrasly.ai/*'];
-async function humanize(id, text) {
+async function humanizerTab() {
   const tabs = await chrome.tabs.query({ url: PHRASLY }).catch(() => []);
-  const tab = tabs.find(t => /\/humanizer/i.test(new URL(t.url).pathname));
+  return tabs.find(t => /\/humanizer/i.test(new URL(t.url).pathname)) ?? null;
+}
+async function humanize(id, text) {
+  const tab = await humanizerTab();
   if (!tab) {
-    post('/log', { line: `snip #${id}: no Phrasly humanizer tab is open, so the bar keeps ChatGPT's answer` });
+    // The tab was closed while ChatGPT was answering: show ChatGPT's answer after all.
+    post('/log', { line: `snip #${id}: the Phrasly humanizer tab is gone, so the bar shows ChatGPT's answer` });
+    post('/answer', { id, text, done: true });
     return;
   }
   const message = { type: 'humanize', id, text };
@@ -150,7 +155,7 @@ async function humanize(id, text) {
     // The tab was opened before the extension was loaded: start the script there and try once more.
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['phrasly.js'] }).catch(() => {});
     await chrome.tabs.sendMessage(tab.id, message).catch(() =>
-      post('/answer', { id, stage: 'humanize', error: 'the Phrasly tab did not respond; refresh it' }));
+      post('/answer', { id, stage: 'humanize', error: 'the Phrasly tab did not respond; refresh it', text }));
   }
 }
 
@@ -179,6 +184,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     case 'humanize':
       humanize(msg.id, msg.text);
       return false;
+    case 'humanizer':
+      humanizerTab().then(tab => reply({ open: !!tab }));
+      return true;
   }
   return false;
 });

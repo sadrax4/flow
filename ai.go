@@ -102,8 +102,9 @@ type aiReply struct {
 	Done  bool   `json:"done"`
 	Error string `json:"error"`
 	Debug string `json:"debug"` // page structure sent with an error, written to the log
-	// "" for ChatGPT's answer; with a Phrasly humanizer tab open the extension then sends "humanizing", and
-	// "humanized" with Phrasly's version of the text, or an error with "humanize".
+	// "" for ChatGPT's answer. With a Phrasly humanizer tab open the bar shows no text until Phrasly's version:
+	// the extension sends "answering" and "humanizing" (no text), then "humanized" with Phrasly's text, or an
+	// error with "humanize" and ChatGPT's text to show instead.
 	Stage string `json:"stage"`
 }
 
@@ -379,6 +380,8 @@ func aiAnswerHandler(w http.ResponseWriter, r *http.Request) {
 		if a.Debug != "" {
 			aiLog("ChatGPT page at that moment:\n%s", a.Debug)
 		}
+	case a.Stage == "answering":
+		aiLog("snip #%d: ChatGPT is answering; the bar waits for Phrasly's version", a.ID)
 	case a.Stage == "humanizing":
 		aiLog("snip #%d: Phrasly is humanizing the answer", a.ID)
 	case a.Stage == "humanized":
@@ -608,7 +611,11 @@ func aiShowAnswer(a aiReply) {
 	}
 	switch {
 	case a.Error != "" && a.Stage == "humanize":
-		// ChatGPT's answer stays in the bar.
+		// Phrasly couldn't humanize it, so the bar shows ChatGPT's answer after all.
+		if strings.TrimSpace(a.Text) != "" {
+			showText(a.Text, false)
+			aiShownID = a.ID
+		}
 		showToast("Phrasly: "+a.Error, colorWarn, 5*time.Second)
 		render()
 		return
@@ -616,8 +623,12 @@ func aiShowAnswer(a aiReply) {
 		showToast("ChatGPT: "+a.Error, colorError, 5*time.Second)
 		render()
 		return
+	case a.Stage == "answering":
+		showToast("ChatGPT is answering...", colorAccent, 30*time.Second)
+		render()
+		return
 	case a.Stage == "humanizing":
-		showToast("Humanizing...", colorAccent, 3*time.Second)
+		showToast("Humanizing...", colorAccent, 60*time.Second)
 		render()
 		return
 	case strings.TrimSpace(a.Text) == "":

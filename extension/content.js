@@ -392,9 +392,20 @@
     throw new Error('could not send');
   }
 
+  // Whether a Phrasly humanizer tab is open; if so, ChatGPT's text isn't shown, only Phrasly's version of it.
+  async function humanizerOpen() {
+    try {
+      return (await chrome.runtime.sendMessage({ type: 'humanizer' }))?.open === true;
+    } catch {
+      return false;
+    }
+  }
+
   async function streamAnswer(id, step, ctx = { known: new Set() }) {
     let text = '', sent = '', changedAt = Date.now(), sentAt = 0, sawBusy = false, described = false;
     const startedAt = Date.now();
+    const humanizer = await humanizerOpen();
+    if (humanizer) step('a Phrasly humanizer tab is open: the bar waits for its version');
     const deadline = Date.now() + 5 * 60 * 1000;
     try {
       for (;;) {
@@ -410,7 +421,11 @@
           changedAt = Date.now();
         }
         if (text && text !== sent && Date.now() - sentAt > 250) {
-          report({ id, text, done: false });
+          if (!humanizer) {
+            report({ id, text, done: false });
+          } else if (!sent) {
+            report({ id, stage: 'answering' }); // the bar only says ChatGPT is answering
+          }
           sent = text;
           sentAt = Date.now();
         }
@@ -422,9 +437,11 @@
       }
       const complete = Date.now() <= deadline;
       step(complete ? `answer finished, ${text.length} characters` : 'stopped following the answer after 5 minutes');
-      report({ id, text, done: true });
-      // With a Phrasly humanizer tab open, the finished answer goes there next and the bar then shows its version.
-      if (complete && text) send({ type: 'humanize', id, text });
+      if (humanizer && complete && text) {
+        send({ type: 'humanize', id, text }); // Phrasly's version goes to the bar, or this text if it can't humanize it
+      } else {
+        report({ id, text, done: true });
+      }
     } finally {
       sessionStorage.removeItem(PENDING);
     }

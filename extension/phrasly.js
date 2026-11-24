@@ -200,7 +200,8 @@
       } catch (err) {
         debug = `could not describe the page: ${err}`;
       }
-      report({ id, stage: 'humanize', error: e.message || String(e), debug });
+      // ChatGPT's own answer goes along, for the bar to show since Phrasly couldn't humanize it.
+      report({ id, stage: 'humanize', error: e.message || String(e), debug, text });
     }
   }
 
