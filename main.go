@@ -34,6 +34,8 @@ const (
 	wmEndSession     = 0x0016
 	wmKeyDown        = 0x0100
 	wmKeyUp          = 0x0101
+	wmSysKeyDown     = 0x0104
+	wmSysKeyUp       = 0x0105
 	wmChar           = 0x0102
 	wmTimer          = 0x0113
 	wmMouseMove      = 0x0200
@@ -94,18 +96,23 @@ const (
 	toastTimer = 3
 	opacity    = 217
 
-	omegaSlow     = 7.0  // taps, held arrows, wheel: a calm ~0.8s glide at the default speed
-	omegaFast     = 22.0 // sentence and page jumps
-	tapTime       = 180 * time.Millisecond
-	minSpeed      = 1 // held-arrow glide speed, in font-heights per second
-	maxSpeed      = 12
-	defaultSpeed  = 5
-	configVersion = 3
-	separator     = "   •   "
-	hintText      = "Ctrl+V  =  paste your text"
-	maxPassword   = 64
-	maxTextBytes  = 1 << 20
-	largeText     = 100_000 // bytes; above this "Loading..." is shown while shaping
+	omegaSlow    = 7.0  // taps, held arrows, wheel: a calm ~0.8s glide at the default speed
+	omegaFast    = 22.0 // sentence and page jumps
+	tapTime      = 180 * time.Millisecond
+	minSpeed     = 1 // held-arrow glide speed, in font-heights per second
+	maxSpeed     = 12
+	defaultSpeed = 5
+	// F10 auto-scroll: speed in font-heights per second (+/- change it while it is on), and the pause each time
+	// the end of a sentence comes into view.
+	defaultAutoSpeed = 2
+	autoPause        = 4 * time.Second
+	vkF10            = 0x79
+	configVersion    = 3
+	separator        = "   •   "
+	hintText         = "Ctrl+V  =  paste your text"
+	maxPassword      = 64
+	maxTextBytes     = 1 << 20
+	largeText        = 100_000 // bytes; above this "Loading..." is shown while shaping
 
 	colorText   = 0xFFFFFF // COLORREF is 0x00BBGGRR
 	colorDim    = 0xA0A0A0
@@ -125,6 +132,7 @@ const helpText = "Ctrl+V = paste your text\n" +
 	"Right / Left arrow = move the text (hold to glide)\n" +
 	"Up / Down arrow = jump to previous / next sentence\n" +
 	"+ / - = speed\n" +
+	"F10 = auto-scroll on / off (pauses after each sentence)\n" +
 	"Ctrl + Up / Down = text and bar height\n" +
 	"Ctrl + Left / Right = bar width\n" +
 	"Drag = move the bar\n" +
@@ -199,6 +207,7 @@ type config struct {
 	X, Y, W, H, Font int32
 	Pos              float64
 	Speed            int
+	AutoSpeed        int
 }
 
 var (
@@ -307,6 +316,14 @@ var (
 	dragCursor, dragWin point
 
 	speed = defaultSpeed
+
+	autoMode   bool               // F10: the shown text moves on by itself
+	autoActive bool               // the shown text is being auto-scrolled (until its end or new text)
+	autoSpeed  = defaultAutoSpeed // font-heights per second
+	autoEdge   float64            // sentence ends up to here (reading order) have had their pause
+	pauseUntil time.Time
+	lastManual time.Time // the user's own scrolling holds auto-scroll back for a moment
+	manualSeen time.Time
 
 	locked   bool
 	loading  bool
@@ -481,6 +498,7 @@ func applyFont(size int32) {
 	buildChunks()
 	pos = clampPos(keep * total)
 	target = pos
+	manualScroll() // the layout changed: auto-scroll measures again from here
 }
 
 func setFont(size int32) {
@@ -648,6 +666,7 @@ func stopAnim() {
 		call(pKillTimer, hMain, animTimer)
 	}
 	animating, hold, vel = false, 0, 0
+	autoActive = false
 }
 
 func glideTo(p, w float64) {
@@ -672,6 +691,7 @@ func move(dir int, vk, lp uintptr) {
 	if lp&(1<<30) != 0 {
 		return
 	}
+	manualScroll()
 	startAnim()
 	omega = tapOmega()
 	hold, holdVK = dir, vk
@@ -689,10 +709,12 @@ func releaseHold() {
 		}
 	}
 	hold = 0
+	manualScroll()
 }
 
 // Up goes to the start of the current sentence (or the previous one if already there); Down to the next.
 func jumpSentence(dir int) {
+	manualScroll()
 	startAnim()
 	if dir > 0 {
 		dest := maxPos()
@@ -715,6 +737,75 @@ func jumpSentence(dir int) {
 	glideTo(dest, omegaFast)
 }
 
+// F10 turns auto-scroll on and off. While on, the shown text moves on slowly by itself and stops for a moment
+// each time the end of a sentence comes into view; new text (a paste, or an AI answer once it is final) starts it
+// again from where that text is shown.
+func toggleAuto() {
+	autoMode = !autoMode
+	if !autoMode {
+		autoActive = false
+		showToast("Auto-scroll off", colorAccent, 1500*time.Millisecond)
+		return
+	}
+	showToast("Auto-scroll on, speed "+strconv.Itoa(autoSpeed), colorAccent, 1500*time.Millisecond)
+	autoStart()
+}
+
+func autoStart() {
+	if !autoMode || locked || total == 0 {
+		return
+	}
+	startAnim()
+	omega = omegaSlow
+	autoActive = true
+	autoEdge = target // a sentence end already in view gets the first pause
+	pauseUntil, manualSeen = time.Time{}, lastManual
+}
+
+func changeAutoSpeed(d int) {
+	autoSpeed = max(minSpeed, min(maxSpeed, autoSpeed+d))
+	showToast("Auto speed "+strconv.Itoa(autoSpeed), colorAccent, 1500*time.Millisecond)
+	call(pSetTimer, hMain, saveTimer, 500, 0)
+}
+
+// Where the next sentence after `after` starts (in reading order), which is where the one before it ends.
+func nextSentenceEnd(after float64) float64 {
+	for _, c := range chunks {
+		if c.sentenceStart && c.start > after+0.5 {
+			return c.start
+		}
+	}
+	return total
+}
+
+// The user's own scrolling: auto-scroll waits a moment, then goes on from there.
+func manualScroll() { lastManual = time.Now() }
+
+func autoStep(now time.Time, dt float64) {
+	view := float64(bufW - 2*inset())
+	if now.Sub(lastManual) < 1200*time.Millisecond {
+		return
+	}
+	if lastManual != manualSeen { // back from the user's scrolling: ends now in view count as read
+		manualSeen = lastManual
+		autoEdge, pauseUntil = target+view, time.Time{}
+	}
+	if now.Before(pauseUntil) {
+		return
+	}
+	if target >= maxPos() {
+		autoActive = false // the end of the text is in view
+		return
+	}
+	edge := target + view
+	if e := nextSentenceEnd(autoEdge); e < total && e <= edge {
+		autoEdge, pauseUntil = edge, now.Add(autoPause)
+		return
+	}
+	omega = omegaSlow
+	target = clampPos(target + float64(autoSpeed)*float64(px(fontSize))*dt)
+}
+
 func tick() {
 	now := time.Now()
 	dt := math.Min(now.Sub(lastTick).Seconds(), 0.05)
@@ -726,13 +817,16 @@ func tick() {
 			releaseHold()
 		}
 	}
+	if autoActive && hold == 0 {
+		autoStep(now, dt)
+	}
 	// Critically damped spring: starts from rest, accelerates, settles without overshoot.
 	for t := 0.0; t < dt; t += 0.004 {
 		h := math.Min(0.004, dt-t)
 		vel += (omega*omega*(target-pos) - 2*omega*vel) * h
 		pos += vel * h
 	}
-	if hold == 0 && math.Abs(target-pos) < 0.3 && math.Abs(vel) < 6 {
+	if hold == 0 && !autoActive && math.Abs(target-pos) < 0.3 && math.Abs(vel) < 6 {
 		pos = target
 		stopAnim()
 	}
@@ -839,6 +933,7 @@ func copyText() {
 func paste() {
 	if s, ok := clipboardText(); ok && strings.TrimSpace(s) != "" {
 		setText(s)
+		autoStart()
 	}
 }
 
@@ -899,6 +994,7 @@ func resizeWidth(dw int32) {
 	call(pSetWindowPos, hMain, 0, uintptr(x), uintptr(r.Top), uintptr(w), uintptr(r.Bottom-r.Top), swpNoZOrder|swpNoActivate)
 	ensureBuffer()
 	pos, target = clampPos(pos), clampPos(target)
+	manualScroll() // the layout changed: auto-scroll measures again from here
 }
 
 func onKey(vk, lp uintptr) {
@@ -953,17 +1049,29 @@ func onKey(vk, lp uintptr) {
 	case vkUp:
 		jumpSentence(-1)
 	case vkNext:
+		manualScroll()
 		glideBy(float64(bufW-2*inset()), omegaFast)
 	case vkPrior:
+		manualScroll()
 		glideBy(-float64(bufW-2*inset()), omegaFast)
 	case vkEnd:
+		manualScroll()
 		glideTo(maxPos(), omegaFast)
 	case vkHome:
+		manualScroll()
 		glideTo(0, omegaFast)
 	case vkOemPlus, vkAdd:
-		changeSpeed(1)
+		if autoMode {
+			changeAutoSpeed(1)
+		} else {
+			changeSpeed(1)
+		}
 	case vkOemMinus, vkSubtract:
-		changeSpeed(-1)
+		if autoMode {
+			changeAutoSpeed(-1)
+		} else {
+			changeSpeed(-1)
+		}
 	case vkDelete, vkBack:
 		if wasSelected {
 			setText("")
@@ -996,7 +1104,7 @@ func saveText() {
 
 func saveSettings() {
 	r := windowRect()
-	b, _ := json.Marshal(config{V: configVersion, X: r.Left, Y: r.Top, W: r.Right - r.Left, H: r.Bottom - r.Top, Font: fontSize, Pos: pos, Speed: speed})
+	b, _ := json.Marshal(config{V: configVersion, X: r.Left, Y: r.Top, W: r.Right - r.Left, H: r.Bottom - r.Top, Font: fontSize, Pos: pos, Speed: speed, AutoSpeed: autoSpeed})
 	if p := dataPath("settings.json"); p != "" {
 		os.WriteFile(p, b, 0o644)
 	}
@@ -1046,6 +1154,16 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 			releaseHold()
 		}
 		return 0
+	case wmSysKeyDown, wmSysKeyUp:
+		// F10 comes as a system key; taking it here keeps Windows from entering menu mode.
+		if wp != vkF10 {
+			break
+		}
+		if msg == wmSysKeyDown && lp&(1<<30) == 0 && !locked {
+			toggleAuto()
+			render()
+		}
+		return 0
 	case wmKillFocus:
 		releaseHold()
 	case wmMouseWheel:
@@ -1061,6 +1179,7 @@ func mainProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 			}
 			render()
 		} else {
+			manualScroll()
 			glideBy(-delta/120*step()/2, tapOmega())
 		}
 		return 0
@@ -1174,6 +1293,9 @@ func main() {
 		}
 		if cfg.Speed >= minSpeed && cfg.Speed <= maxSpeed {
 			speed = cfg.Speed
+		}
+		if cfg.AutoSpeed >= minSpeed && cfg.AutoSpeed <= maxSpeed {
+			autoSpeed = cfg.AutoSpeed
 		}
 	}
 	// The password is asked on every launch; an unlock file left by version 1.1.0 is removed.

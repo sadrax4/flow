@@ -484,6 +484,7 @@ func aiOnClipboard() {
 	id := aiNextID.Add(1)
 	aiCurrent.Store(id)
 	aiLog("snip #%d: %s image of %d KB from %s, asking ChatGPT", id, kind, len(data)>>10, owner)
+	autoActive = false // the previous answer stops moving; the new one starts once it is final
 	showToast("Asking ChatGPT...", colorAccent, 3*time.Second)
 	render()
 	taken := time.Now()
@@ -615,6 +616,7 @@ func aiShowAnswer(a aiReply) {
 		if strings.TrimSpace(a.Text) != "" {
 			showText(a.Text, false)
 			aiShownID = a.ID
+			autoStart()
 		}
 		showToast("Phrasly: "+a.Error, colorWarn, 5*time.Second)
 		render()
@@ -636,10 +638,14 @@ func aiShowAnswer(a aiReply) {
 	case a.Stage == "humanized":
 		showText(a.Text, false) // a new text, read from the start
 		aiShownID = a.ID
+		autoStart()
 		showToast("Humanized", colorAccent, 2*time.Second)
 		render()
 		return
 	}
 	showText(a.Text, a.ID == aiShownID)
 	aiShownID = a.ID
+	if a.Done { // ChatGPT's final answer (no Phrasly humanizer open)
+		autoStart()
+	}
 }
