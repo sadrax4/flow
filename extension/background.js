@@ -141,9 +141,12 @@ async function humanizerTab() {
   return tabs.find(t => /\/humanizer/i.test(new URL(t.url).pathname)) ?? null;
 }
 // Runs inside the Phrasly page (not the extension's isolated view of it): gives the input box's React change
-// handler the text, as typing would. Used when a background tab missed the typed edit.
+// handler the text, as typing would. Used when a background tab missed the typed edit. Self-contained, as it's
+// sent to the page on its own; the placeholders are the ones phrasly.js looks for.
 function reactSetInput(text) {
-  const box = [...document.querySelectorAll('textarea')].find(t => /paste it here/i.test(t.placeholder || '')) ?? document.querySelector('textarea');
+  const boxes = [...document.querySelectorAll('textarea')].filter(t => !t.readOnly && t.getClientRects().length > 0);
+  const box = boxes.find(t => /paste text from any app|click here to type|tap to type|paste it here/i.test(t.placeholder || ''))
+    ?? boxes.find(t => t.closest('#humanizer-container, [data-phone-shell]')) ?? boxes[0];
   if (!box) return 'no input box';
   const key = Object.keys(box).find(k => k.startsWith('__reactProps$'));
   const onChange = key && box[key]?.onChange;
@@ -170,14 +173,22 @@ async function humanize(id, text) {
     return;
   }
   const message = { type: 'humanize', id, text };
-  try {
-    await chrome.tabs.sendMessage(tab.id, message);
-  } catch {
+  const handed = () => chrome.tabs.sendMessage(tab.id, message).then(() => true, () => false);
+  if (await handed()) return;
+  if (!tab.discarded) {
     // The tab was opened before the extension was loaded: start the script there and try once more.
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['phrasly.js'] }).catch(() => {});
-    await chrome.tabs.sendMessage(tab.id, message).catch(() =>
-      post('/answer', { id, stage: 'humanize', error: 'the Phrasly tab did not respond; refresh it', text }));
+    if (await handed()) return;
   }
+  // Chrome unloaded the tab to save memory, or its page stopped answering: load it again and hand the answer over
+  // once the script there is up.
+  post('/log', { line: `snip #${id}: the Phrasly tab ${tab.discarded ? 'was unloaded by Chrome' : 'did not respond'}; reloading it` });
+  await chrome.tabs.reload(tab.id).catch(() => {});
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    if (await handed()) return;
+  }
+  post('/answer', { id, stage: 'humanize', error: 'the Phrasly tab did not respond; refresh it', text });
 }
 
 // After an install or an update, start in the ChatGPT and Phrasly tabs that are already open, so they need no refresh.
